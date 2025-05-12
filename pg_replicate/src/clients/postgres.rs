@@ -22,6 +22,7 @@ pub struct SlotInfo {
 pub struct ReplicationClient {
     postgres_client: PostgresClient,
     in_txn: bool,
+    postgres_version: i32,
 }
 
 #[derive(Debug, Error)]
@@ -58,6 +59,9 @@ pub enum ReplicationClientError {
 
     #[error("rustls error: {0}")]
     RustlsError(#[from] rustls::Error),
+
+    #[error("invalid version number")]
+    InvalidVersion,
 }
 
 impl ReplicationClient {
@@ -81,11 +85,22 @@ impl ReplicationClient {
             info!("connection terminated successfully")
         });
 
+        let version_num: i32 = postgres_client
+            .simple_query("SHOW server_version_num")
+            .await?
+            .iter()
+            .find_map(|msg| match msg {
+                tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+                _ => None,
+            })
+            .ok_or(ReplicationClientError::InvalidVersion)?;
+
         info!("successfully connected to postgres");
 
         Ok(ReplicationClient {
             postgres_client,
             in_txn: false,
+            postgres_version: version_num,
         })
     }
 
@@ -120,11 +135,22 @@ impl ReplicationClient {
             info!("connection terminated successfully")
         });
 
+        let version_num: i32 = postgres_client
+            .simple_query("SHOW server_version_num")
+            .await?
+            .iter()
+            .find_map(|msg| match msg {
+                tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+                _ => None,
+            })
+            .ok_or(ReplicationClientError::InvalidVersion)?;
+
         info!("successfully connected to postgres");
 
         Ok(ReplicationClient {
             postgres_client,
             in_txn: false,
+            postgres_version: version_num,
         })
     }
 
@@ -183,24 +209,28 @@ impl ReplicationClient {
         publication: Option<&str>,
     ) -> Result<Vec<ColumnSchema>, ReplicationClientError> {
         let (pub_cte, pub_pred) = if let Some(publication) = publication {
-            (
-                format!(
-                    "with pub_attrs as (
+            if self.postgres_version >= 150000 {
+                (
+                    format!(
+                        "with pub_attrs as (
                         select unnest(r.prattrs)
                         from pg_publication_rel r
                         left join pg_publication p on r.prpubid = p.oid
                         where p.pubname = {publication}
                         and r.prrelid = {table_id}
                     )",
-                    publication = quote_literal(publication),
-                ),
-                "and (
+                        publication = quote_literal(publication),
+                    ),
+                    "and (
                     case (select count(*) from pub_attrs)
                     when 0 then true
                     else (a.attnum in (select * from pub_attrs))
                     end
                 )",
-            )
+                )
+            } else {
+                ("".into(), "")
+            }
         } else {
             ("".into(), "")
         };
