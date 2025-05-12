@@ -17,6 +17,10 @@ required-features = ["duckdb"]
 name = "stdout"
 required-features = ["stdout"]
 
+[[example]]
+name = "clickhouse"
+required-features = ["clickhouse"]
+
 [dependencies]
 postgres = { workspace = true, features = ["tokio"]}
 
@@ -25,6 +29,7 @@ bigdecimal = { workspace = true, features = ["std"] }
 bytes = { workspace = true }
 byteorder = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+clickhouse = { workspace = true, optional = true }
 duckdb = { workspace = true, optional = true }
 futures = { workspace = true }
 gcp-bigquery-client = { workspace = true, optional = true, features = [
@@ -66,6 +71,7 @@ tracing-subscriber = { workspace = true, default-features = true, features = [
 [features]
 bigquery = ["dep:gcp-bigquery-client", "dep:prost"]
 duckdb = ["dep:duckdb"]
+clickhouse = ["dep:clickhouse"]
 stdout = []
 # When enabled converts unknown types to bytes
 unknown_types_to_bytes = []

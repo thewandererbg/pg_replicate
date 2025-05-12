@@ -1,0 +1,15 @@
+source:
+  postgres:
+    host: "172.17.0.1"
+    port: 5432
+    name: "postgres"
+    username: "postgres"
+    password: "password"
+    slot_name: "stdout_slot"
+    publication: "my_publication"
+sink:
+  click_house:
+    url: "http://172.17.0.1:8123"
+    database: "pgrep"
+    username: "default"
+    password: "password"

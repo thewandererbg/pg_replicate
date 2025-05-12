@@ -15,6 +15,8 @@ pub mod bigquery;
 pub mod duckdb;
 #[cfg(feature = "stdout")]
 pub mod stdout;
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
 
 pub trait SinkError: std::error::Error + Send + Sync + 'static {}
 
