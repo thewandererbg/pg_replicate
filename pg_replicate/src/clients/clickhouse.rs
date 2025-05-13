@@ -53,11 +53,13 @@ impl ClickHouseClient {
         &self,
         table_name: &str,
         column_schemas: &[ColumnSchema],
+        engine: &str,
     ) -> Result<bool, CHError> {
         if self.table_exists(table_name).await? {
             Ok(false)
         } else {
-            self.create_table(table_name, column_schemas).await?;
+            self.create_table(table_name, column_schemas, engine)
+                .await?;
             Ok(true)
         }
     }
@@ -134,7 +136,7 @@ impl ClickHouseClient {
         }
     }
 
-    fn create_columns_spec(column_schemas: &[ColumnSchema]) -> String {
+    fn create_columns_spec(column_schemas: &[ColumnSchema], engine: &str) -> String {
         let mut s = String::new();
         s.push('(');
 
@@ -142,55 +144,56 @@ impl ClickHouseClient {
             Self::column_spec(column_schema, &mut s);
             s.push(',');
         }
-        s.push_str("_version UInt64 DEFAULT toUInt64(now64(9))*1000,");
-        s.push_str("_is_deleted UInt8 DEFAULT 0");
+
+        // _version and _is_deleted is meta column of replacingmergetree engine
+        // https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree
+        if engine == "ReplacingMergeTree" {
+            s.push_str("_version UInt64 DEFAULT toUInt64(now64(9))*1000,");
+            s.push_str("_is_deleted UInt8 DEFAULT 0");
+        } else {
+            s.pop(); // Remove the trailing comma
+        }
 
         s.push(')');
 
-        s
-    }
-
-    fn primary_key_clause(column_schemas: &[ColumnSchema]) -> String {
         let primary_columns: Vec<&str> = column_schemas
             .iter()
             .filter(|s| s.primary)
             .map(|s| s.name.as_str())
             .collect();
 
-        if primary_columns.is_empty() {
-            "".to_string()
+        if engine == "ReplacingMergeTree" {
+            s.push_str("ENGINE = ReplacingMergeTree(_version, _is_deleted) ");
         } else {
-            format!(" ORDER BY ({})", primary_columns.join(", "))
+            s.push_str("ENGINE = MergeTree() ");
         }
+
+        // https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree#selecting-a-primary-key
+        if primary_columns.is_empty() {
+            s.push_str("ORDER BY tuple()");
+        } else {
+            s.push_str(&format!(" ORDER BY ({})", primary_columns.join(", ")));
+        }
+
+        s
     }
 
     pub async fn create_table(
         &self,
         table_name: &str,
         column_schemas: &[ColumnSchema],
+        engine: &str,
     ) -> Result<(), CHError> {
-        let columns_spec = Self::create_columns_spec(column_schemas);
-        let primary_key_clause = Self::primary_key_clause(column_schemas);
+        let columns_spec = Self::create_columns_spec(column_schemas, engine);
 
         info!(
             "creating table {}.{} in clickhouse",
             self.database, table_name
         );
 
-        if primary_key_clause.is_empty() {
-            return Err(CHError::Custom(
-                "Cannot create table without primary key".to_string(),
-            ));
-        }
-
-        let engine = format!(
-            "ENGINE = ReplacingMergeTree(_version, _is_deleted){}",
-            primary_key_clause
-        );
-
         let query = format!(
-            "CREATE TABLE IF NOT EXISTS {}.{} {} {}",
-            &self.database, table_name, columns_spec, engine
+            "CREATE TABLE IF NOT EXISTS {}.{} {}",
+            &self.database, table_name, columns_spec
         );
 
         self.client.query(&query).execute().await?;
@@ -213,7 +216,7 @@ impl ClickHouseClient {
         // Use fetch_one directly with the LsnRow type
         let row: LsnRow = self
             .client
-            .query("SELECT ?fields FROM ?.last_lsn")
+            .query("SELECT ?fields FROM ?._last_lsn")
             .bind(Identifier(&self.database))
             .fetch_one()
             .await?;
@@ -225,7 +228,7 @@ impl ClickHouseClient {
         let lsn: u64 = lsn.into();
 
         let database = &self.database;
-        let query = format!("ALTER TABLE {database}.last_lsn UPDATE lsn = {lsn} WHERE id = 1",);
+        let query = format!("ALTER TABLE {database}._last_lsn UPDATE lsn = {lsn} WHERE id = 1",);
 
         let _ = self.client.query(&query).execute().await?;
 
@@ -234,7 +237,7 @@ impl ClickHouseClient {
 
     pub async fn insert_last_lsn_row(&self) -> Result<(), CHError> {
         let database = &self.database;
-        let query = format!("INSERT INTO {database}.last_lsn (id, lsn) VALUES (1, 0)",);
+        let query = format!("INSERT INTO {database}._last_lsn (id, lsn) VALUES (1, 0)",);
 
         let _ = self.client.query(&query).execute().await?;
 
@@ -244,7 +247,7 @@ impl ClickHouseClient {
     pub async fn get_copied_table_ids(&self) -> Result<HashSet<TableId>, CHError> {
         let rows: Vec<TableIdRow> = self
             .client
-            .query("SELECT table_id FROM ?.copied_tables")
+            .query("SELECT table_id FROM ?._copied_tables")
             .bind(Identifier(&self.database))
             .fetch_all()
             .await?;
@@ -257,7 +260,7 @@ impl ClickHouseClient {
 
     pub async fn insert_into_copied_tables(&self, table_id: TableId) -> Result<(), CHError> {
         let database = &self.database;
-        let query = format!("INSERT INTO {database}.copied_tables (table_id) VALUES ({table_id})");
+        let query = format!("INSERT INTO {database}._copied_tables (table_id) VALUES ({table_id})");
 
         let _ = self.client.query(&query).execute().await?;
 

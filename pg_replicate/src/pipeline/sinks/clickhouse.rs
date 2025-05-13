@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use chrono::Utc;
 use async_trait::async_trait;
+use chrono::Utc;
+use clickhouse::error::Error as CHError;
 use thiserror::Error;
 use tokio_postgres::types::{PgLsn, Type};
 use tracing::info;
-use clickhouse::error::Error as CHError;
 
 use crate::{
     clients::clickhouse::ClickHouseClient,
@@ -50,9 +50,9 @@ impl ClickHouseBatchSink {
         username: String,
         password: String,
     ) -> Result<ClickHouseBatchSink, CHError> {
-        let client = ClickHouseClient::new_with_credentials(
-            &url, database.clone(), &username, &password
-        ).await?;
+        let client =
+            ClickHouseClient::new_with_credentials(&url, database.clone(), &username, &password)
+                .await?;
 
         Ok(ClickHouseBatchSink {
             client,
@@ -71,7 +71,11 @@ impl ClickHouseBatchSink {
     }
 
     fn table_name_in_ch(table_name: &TableName) -> String {
-        format!("{}_{}", table_name.schema, table_name.name)
+        if table_name.schema == "public" {
+            format!("{}", table_name.name)
+        } else {
+            format!("{}_{}", table_name.schema, table_name.name)
+        }
     }
 }
 
@@ -90,10 +94,7 @@ impl BatchSink for ClickHouseBatchSink {
         }];
 
         self.client
-            .create_table_if_missing(
-                "copied_tables",
-                &copied_table_column_schemas,
-            )
+            .create_table_if_missing("_copied_tables", &copied_table_column_schemas, "MergeTree")
             .await?;
 
         let last_lsn_column_schemas = [
@@ -114,10 +115,7 @@ impl BatchSink for ClickHouseBatchSink {
         ];
         if self
             .client
-            .create_table_if_missing(
-                "last_lsn",
-                &last_lsn_column_schemas
-            )
+            .create_table_if_missing("_last_lsn", &last_lsn_column_schemas, "MergeTree")
             .await?
         {
             self.client.insert_last_lsn_row().await?;
@@ -145,6 +143,7 @@ impl BatchSink for ClickHouseBatchSink {
                 .create_table_if_missing(
                     &table_name,
                     &table_schema.column_schemas,
+                    "ReplacingMergeTree",
                 )
                 .await?;
         }
@@ -178,7 +177,6 @@ impl BatchSink for ClickHouseBatchSink {
             primary: false,
         });
 
-
         // Add version and tombstone marker to each row
         let _version = Utc::now().timestamp_millis();
         for table_row in table_rows.iter_mut() {
@@ -210,7 +208,9 @@ impl BatchSink for ClickHouseBatchSink {
                         if commit_lsn == final_lsn {
                             new_last_lsn = commit_lsn;
                         } else {
-                            Err(ClickHouseSinkError::IncorrectCommitLsn(commit_lsn, final_lsn))?
+                            Err(ClickHouseSinkError::IncorrectCommitLsn(
+                                commit_lsn, final_lsn,
+                            ))?
                         }
                     } else {
                         Err(ClickHouseSinkError::CommitWithoutBegin)?
@@ -280,9 +280,7 @@ impl BatchSink for ClickHouseBatchSink {
 
         // Update LSN if needed
         if new_last_lsn != PgLsn::from(0) {
-            self.client
-                .set_last_lsn(new_last_lsn)
-                .await?;
+            self.client.set_last_lsn(new_last_lsn).await?;
             self.committed_lsn = Some(new_last_lsn);
         }
 
@@ -291,18 +289,14 @@ impl BatchSink for ClickHouseBatchSink {
     }
 
     async fn table_copied(&mut self, table_id: TableId) -> Result<(), Self::Error> {
-        self.client
-            .insert_into_copied_tables(table_id)
-            .await?;
+        self.client.insert_into_copied_tables(table_id).await?;
         Ok(())
     }
 
     async fn truncate_table(&mut self, table_id: TableId) -> Result<(), Self::Error> {
         if let Some(table_schema) = self.table_schemas.as_ref().and_then(|ts| ts.get(&table_id)) {
             let table_name = Self::table_name_in_ch(&table_schema.table_name);
-            self.client
-                .truncate_table(&table_name)
-                .await?;
+            self.client.truncate_table(&table_name).await?;
         }
         Ok(())
     }
