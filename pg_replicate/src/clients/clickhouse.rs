@@ -398,7 +398,10 @@ impl ClickHouseClient {
             Cell::TimeStamp(t) => write!(s, "'{}'", t.format("%Y-%m-%dT%H:%M:%S.%6f")).unwrap(),
             Cell::TimeStampTz(t) => write!(s, "'{}'", t.format("%Y-%m-%dT%H:%M:%S.%6f")).unwrap(),
             Cell::Uuid(u) => write!(s, "'{u}'").unwrap(),
-            Cell::Json(j) => write!(s, "'{j}'").unwrap(),
+            Cell::Json(j) => {
+                let escaped = j.to_string().replace('\'', "\\'");
+                write!(s, "'{}'", escaped).unwrap();
+            }
             Cell::Bytes(b) => {
                 let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
                 write!(s, "unhex('{hex}')").unwrap();
