@@ -49,6 +49,36 @@ impl ClickHouseClient {
         Ok(ClickHouseClient { client, database })
     }
 
+    pub async fn create_or_update_table(
+        &self,
+        table_name: &str,
+        column_schemas: &[ColumnSchema],
+        engine: &str,
+    ) -> Result<bool, CHError> {
+        if self.table_exists(table_name).await? {
+            // If table exists, check for new columns
+            let existing_columns = self.get_table_columns(&table_name).await?;
+
+            // Find columns that exist in the new schema but not in the table
+            let new_columns: Vec<&ColumnSchema> = column_schemas
+                .iter()
+                .filter(|col| !existing_columns.contains(&col.name))
+                .collect();
+
+            // If there are new columns, add them to the table
+            if !new_columns.is_empty() {
+                for column in &new_columns {
+                    self.add_column_to_table(&table_name, column).await?;
+                }
+            }
+            Ok(false)
+        } else {
+            self.create_table(table_name, column_schemas, engine)
+                .await?;
+            Ok(true)
+        }
+    }
+
     pub async fn create_table_if_missing(
         &self,
         table_name: &str,
@@ -386,6 +416,33 @@ impl ClickHouseClient {
                 s.push(']');
             }
         }
+    }
+
+    // Get existing columns for a table
+    pub async fn get_table_columns(&self, table_name: &str) -> Result<HashSet<String>, CHError> {
+        let query = format!(
+            "SELECT name FROM system.columns WHERE table = '{}'",
+            table_name
+        );
+        let result: Vec<String> = self.client.query(&query).fetch_all().await?;
+
+        Ok(result.into_iter().collect())
+    }
+
+    // Add a new column to an existing table
+    pub async fn add_column_to_table(
+        &self,
+        table_name: &str,
+        column: &ColumnSchema,
+    ) -> Result<(), CHError> {
+        let mut column_type = String::new();
+        Self::column_spec(column, &mut column_type);
+
+        let query = format!("ALTER TABLE {} ADD COLUMN {}", table_name, column_type);
+
+        self.client.query(&query).execute().await?;
+
+        Ok(())
     }
 }
 

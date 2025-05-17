@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -138,9 +138,8 @@ impl BatchSink for ClickHouseBatchSink {
     ) -> Result<(), Self::Error> {
         for table_schema in table_schemas.values() {
             let table_name = Self::table_name_in_ch(&table_schema.table_name);
-
             self.client
-                .create_table_if_missing(
+                .create_or_update_table(
                     &table_name,
                     &table_schema.column_schemas,
                     "ReplacingMergeTree",
@@ -152,6 +151,7 @@ impl BatchSink for ClickHouseBatchSink {
 
         Ok(())
     }
+
     async fn write_table_rows(
         &mut self,
         mut table_rows: Vec<TableRow>,
@@ -197,6 +197,7 @@ impl BatchSink for ClickHouseBatchSink {
 
         let _version = Utc::now().timestamp_millis();
         for event in events {
+            // info!("{event:?}");
             match event {
                 CdcEvent::Begin(begin_body) => {
                     let final_lsn_u64 = begin_body.final_lsn();
@@ -245,7 +246,31 @@ impl BatchSink for ClickHouseBatchSink {
                         self.client.truncate_table(&table_name).await?;
                     }
                 }
-                CdcEvent::Relation(_) => {}
+                CdcEvent::Relation(r) => {
+                    let relation_column_names: HashSet<_> = r
+                        .columns()
+                        .iter()
+                        .filter_map(|col| col.name().ok())
+                        .map(String::from)
+                        .collect();
+
+                    let table_name =
+                        Self::table_name_in_ch(&self.get_table_schema(r.rel_id())?.table_name);
+                    let existing_columns = self.client.get_table_columns(&table_name).await?;
+
+                    let new_columns: Vec<_> = relation_column_names
+                        .difference(&existing_columns)
+                        .collect();
+
+                    if !new_columns.is_empty() {
+                        info!(
+                            "Detected new columns in {}: {:?}, restarting the replication",
+                            table_name, new_columns
+                        );
+                        std::process::exit(0);
+                    }
+                }
+
                 CdcEvent::KeepAliveRequested { reply: _ } => {}
                 CdcEvent::Type(_) => {}
             }
