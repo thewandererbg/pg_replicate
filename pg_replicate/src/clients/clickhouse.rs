@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt::Write;
 
-use clickhouse::{error::Error as CHError, sql::Identifier, Client, Row};
+use clickhouse::{error::Error as CHError, sql::Identifier, Client};
 use tokio_postgres::types::{PgLsn, Type};
 use tracing::info;
 
@@ -10,23 +10,6 @@ use crate::{
     conversions::table_row::TableRow,
     table::{ColumnSchema, TableId},
 };
-use serde::Deserialize;
-
-// Define row structs with proper lifetime parameter
-#[derive(Row, Deserialize)]
-struct CountRow {
-    count: u64,
-}
-
-#[derive(Row, Deserialize)]
-struct LsnRow {
-    lsn: i64,
-}
-
-#[derive(Row, Deserialize)]
-struct TableIdRow {
-    table_id: i64,
-}
 
 pub struct ClickHouseClient {
     client: Client,
@@ -221,78 +204,84 @@ impl ClickHouseClient {
             self.database, table_name
         );
 
-        let query = format!(
-            "CREATE TABLE IF NOT EXISTS {}.{} {}",
-            &self.database, table_name, columns_spec
-        );
+        let query = format!("CREATE TABLE IF NOT EXISTS ?.? {}", columns_spec);
 
-        self.client.query(&query).execute().await?;
+        self.client
+            .query(&query)
+            .bind(Identifier(&self.database))
+            .bind(Identifier(table_name))
+            .execute()
+            .await?;
         Ok(())
     }
 
     pub async fn table_exists(&self, table_name: &str) -> Result<bool, CHError> {
-        let row: CountRow = self
+        let count = self
             .client
-            .query("SELECT count() AS count FROM system.tables WHERE database = ? AND name = ?")
+            .query("SELECT count() FROM system.tables WHERE database = ? AND name = ?")
             .bind(&self.database)
             .bind(table_name)
-            .fetch_one()
+            .fetch_one::<u64>()
             .await?;
 
-        Ok(row.count > 0)
+        Ok(count > 0)
     }
 
     pub async fn get_last_lsn(&self) -> Result<PgLsn, CHError> {
-        // Use fetch_one directly with the LsnRow type
-        let row: LsnRow = self
+        let lsn = self
             .client
-            .query("SELECT ?fields FROM ?._last_lsn")
+            .query("SELECT lsn FROM ?._last_lsn")
             .bind(Identifier(&self.database))
-            .fetch_one()
+            .fetch_one::<u64>()
             .await?;
 
-        Ok((row.lsn as u64).into())
+        Ok(lsn.into())
     }
 
     pub async fn set_last_lsn(&self, lsn: PgLsn) -> Result<(), CHError> {
         let lsn: u64 = lsn.into();
 
-        let database = &self.database;
-        let query = format!("ALTER TABLE {database}._last_lsn UPDATE lsn = {lsn} WHERE id = 1",);
-
-        let _ = self.client.query(&query).execute().await?;
+        let _ = self
+            .client
+            .query("ALTER TABLE ?._last_lsn UPDATE lsn = ? WHERE id = 1")
+            .bind(Identifier(&self.database))
+            .bind(lsn)
+            .execute()
+            .await?;
 
         Ok(())
     }
 
     pub async fn insert_last_lsn_row(&self) -> Result<(), CHError> {
-        let database = &self.database;
-        let query = format!("INSERT INTO {database}._last_lsn (id, lsn) VALUES (1, 0)",);
-
-        let _ = self.client.query(&query).execute().await?;
+        let _ = self
+            .client
+            .query("INSERT INTO ?._last_lsn (id, lsn) VALUES (1, 0)")
+            .bind(Identifier(&self.database))
+            .execute()
+            .await?;
 
         Ok(())
     }
 
     pub async fn get_copied_table_ids(&self) -> Result<HashSet<TableId>, CHError> {
-        let rows: Vec<TableIdRow> = self
+        let table_ids: Vec<u32> = self
             .client
-            .query("SELECT table_id FROM ?._copied_tables")
+            .query("SELECT toUInt32(table_id) as table_id FROM ?._copied_tables")
             .bind(Identifier(&self.database))
-            .fetch_all()
+            .fetch_all::<u32>()
             .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| row.table_id as TableId)
-            .collect())
+        Ok(table_ids.into_iter().collect())
     }
 
     pub async fn insert_into_copied_tables(&self, table_id: TableId) -> Result<(), CHError> {
-        let database = &self.database;
-        let query = format!("INSERT INTO {database}._copied_tables (table_id) VALUES ({table_id})");
-
-        let _ = self.client.query(&query).execute().await?;
+        let _ = self
+            .client
+            .query("INSERT INTO ?._copied_tables (table_id) VALUES (?)")
+            .bind(Identifier(&self.database))
+            .bind(table_id)
+            .execute()
+            .await?;
 
         Ok(())
     }
@@ -314,9 +303,14 @@ impl ClickHouseClient {
     pub async fn drop_table(&self, table_name: &str) -> Result<(), CHError> {
         let database = &self.database;
         info!("dropping table {database}.{table_name} ClickHouse");
-        let query = format!("drop table if exists {database}.{table_name}",);
 
-        let _ = self.client.query(&query).execute().await?;
+        let _ = self
+            .client
+            .query("drop table if exists ?.?")
+            .bind(Identifier(&self.database))
+            .bind(Identifier(table_name))
+            .execute()
+            .await?;
 
         Ok(())
     }
@@ -324,9 +318,14 @@ impl ClickHouseClient {
     pub async fn truncate_table(&self, table_name: &str) -> Result<(), CHError> {
         let database = &self.database;
         info!("truncating table {database}.{table_name} ClickHouse");
-        let query = format!("truncate table if exists {database}.{table_name}",);
 
-        let _ = self.client.query(&query).execute().await?;
+        let _ = self
+            .client
+            .query("truncate table if exists ?.?")
+            .bind(Identifier(&self.database))
+            .bind(Identifier(table_name))
+            .execute()
+            .await?;
 
         Ok(())
     }
@@ -423,11 +422,12 @@ impl ClickHouseClient {
 
     // Get existing columns for a table
     pub async fn get_table_columns(&self, table_name: &str) -> Result<HashSet<String>, CHError> {
-        let query = format!(
-            "SELECT name FROM system.columns WHERE table = '{}'",
-            table_name
-        );
-        let result: Vec<String> = self.client.query(&query).fetch_all().await?;
+        let result: Vec<String> = self
+            .client
+            .query("SELECT name FROM system.columns WHERE table = ?")
+            .bind(table_name)
+            .fetch_all()
+            .await?;
 
         Ok(result.into_iter().collect())
     }
