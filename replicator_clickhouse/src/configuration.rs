@@ -1,5 +1,7 @@
 use std::fmt::Debug;
 
+use thiserror::Error;
+
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceSettings {
@@ -116,13 +118,16 @@ impl Debug for TlsSettings {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum TlsSettingsError {
+    #[error("Invalid TLS settings: `trusted_root_certs` must be set when `enabled` is true")]
+    MissingTrustedRootCerts,
+}
+
 impl TlsSettings {
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), TlsSettingsError> {
         if self.enabled && self.trusted_root_certs.is_empty() {
-            return Err(
-                "Invalid TLS settings: `trusted_root_certs` must be set when `enabled` is true"
-                    .to_string(),
-            );
+            return Err(TlsSettingsError::MissingTrustedRootCerts);
         }
         Ok(())
     }
@@ -134,6 +139,7 @@ pub struct Settings {
     pub sink: SinkSettings,
     pub batch: BatchSettings,
     pub tls: TlsSettings,
+    pub project: String,
 }
 
 pub fn get_configuration() -> Result<Settings, config::ConfigError> {
@@ -262,6 +268,7 @@ mod tests {
                 trusted_root_certs: String::new(),
                 enabled: false,
             },
+            project: "abcdefghijklmnopqrst".to_string(),
         };
         assert!(actual.is_ok());
         assert_eq!(expected, actual.unwrap());
@@ -293,6 +300,7 @@ mod tests {
                 trusted_root_certs: String::new(),
                 enabled: false,
             },
+            project: "abcdefghijklmnopqrst".to_string(),
         };
         let expected = r#"{"source":{"postgres":{"host":"localhost","port":5432,"name":"postgres","username":"postgres","password":"postgres","slot_name":"replicator_slot","publication":"replicator_publication"}},"sink":{"click_house":{"url":"http://localhost:8123","database":"default","username":"default","password":"password"}},"batch":{"max_size":1000,"max_fill_secs":10},"tls":{"trusted_root_certs":"","enabled":false}}"#;
         let actual = serde_json::to_string(&actual);

@@ -5,11 +5,9 @@ use clickhouse::{error::Error as CHError, sql::Identifier, Client};
 use tokio_postgres::types::{PgLsn, Type};
 use tracing::info;
 
+use crate::conversions::table_row::TableRow;
 use crate::conversions::{ArrayCell, Cell};
-use crate::{
-    conversions::table_row::TableRow,
-    table::{ColumnSchema, TableId},
-};
+use postgres::schema::{ColumnSchema, TableId};
 
 pub struct ClickHouseClient {
     client: Client,
@@ -292,11 +290,14 @@ impl ClickHouseClient {
         column_schemas: &[ColumnSchema],
         table_rows: &[TableRow],
     ) -> Result<(), CHError> {
-        let batch_queries: Vec<String> =
-            self.create_insert_batch_query(table_name, column_schemas, table_rows);
-        for query in batch_queries {
-            let _ = self.client.query(&query).execute().await?;
-        }
+        let query = Self::create_insert_batch_query(column_schemas, table_rows);
+        let _ = self
+            .client
+            .query(&query)
+            .bind(Identifier(&self.database))
+            .bind(Identifier(table_name))
+            .execute()
+            .await?;
         Ok(())
     }
 
@@ -331,50 +332,39 @@ impl ClickHouseClient {
     }
 
     fn create_insert_batch_query(
-        &self,
-        table_name: &str,
         column_schemas: &[ColumnSchema],
         table_rows: &[TableRow],
-    ) -> Vec<String> {
-        let database = &self.database;
-        let mut batch_queries = Vec::new();
-        let batch_size = 10000;
+    ) -> String {
+        let mut query = format!("INSERT INTO ?.? (");
 
-        // Process rows in batches
-        for chunk in table_rows.chunks(batch_size) {
-            let mut query = format!("INSERT INTO {database}.{table_name} (");
+        for (i, column) in column_schemas.iter().enumerate() {
+            query.push_str(&column.name);
+            if i < column_schemas.len() - 1 {
+                query.push(',');
+            }
+        }
 
-            for (i, column) in column_schemas.iter().enumerate() {
-                query.push_str(&column.name);
-                if i < column_schemas.len() - 1 {
+        query.push_str(") VALUES");
+
+        // Add each row in the current batch
+        for (i, table_row) in table_rows.iter().enumerate() {
+            if i > 0 {
+                query.push_str(", ");
+            }
+
+            query.push('(');
+
+            // Add each value in the row
+            for (j, value) in table_row.values.iter().enumerate() {
+                Self::cell_to_query_value(value, &mut query);
+                if j < table_row.values.len() - 1 {
                     query.push(',');
                 }
             }
-
-            query.push_str(") VALUES");
-
-            // Add each row in the current batch
-            for (i, table_row) in chunk.iter().enumerate() {
-                if i > 0 {
-                    query.push_str(", ");
-                }
-
-                query.push('(');
-
-                // Add each value in the row
-                for (j, value) in table_row.values.iter().enumerate() {
-                    Self::cell_to_query_value(value, &mut query);
-                    if j < table_row.values.len() - 1 {
-                        query.push(',');
-                    }
-                }
-                query.push(')');
-            }
-
-            batch_queries.push(query);
+            query.push(')');
         }
 
-        batch_queries
+        query
     }
 
     fn cell_to_query_value(cell: &Cell, s: &mut String) {

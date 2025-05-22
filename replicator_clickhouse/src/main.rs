@@ -1,6 +1,8 @@
-use std::{error::Error, io::BufReader, time::Duration, vec};
+use std::{io::BufReader, time::Duration, vec};
 
-use configuration::{get_configuration, BatchSettings, SinkSettings, SourceSettings, TlsSettings};
+use configuration::{
+    get_configuration, BatchSettings, Settings, SinkSettings, SourceSettings, TlsSettings,
+};
 use pg_replicate::{
     pipeline::{
         batching::{data_pipeline::BatchDataPipeline, BatchConfig},
@@ -10,49 +12,70 @@ use pg_replicate::{
     },
     SslMode,
 };
-use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use postgres::tokio::options::PgDatabaseOptions;
+use telemetry::init_tracing;
+use tracing::{info, instrument};
 
 mod configuration;
 
-// APP_SOURCE__POSTGRES__PASSWORD and APP_SINK__CLICK_HOUSE__PASSWORD environment variables must be set
+// APP_SOURCE__POSTGRES__PASSWORD environment variables must be set
 // before running because these are sensitive values which can't be configured in the config files
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    if let Err(e) = main_impl().await {
-        error!("{e}");
-    }
-
-    Ok(())
+async fn main() -> anyhow::Result<()> {
+    let app_name = env!("CARGO_BIN_NAME");
+    // We pass emit_on_span_close = false to avoid emitting logs on span close
+    // for replicator because it is not a web server and we don't need to emit logs
+    // for every closing span.
+    let _log_flusher = init_tracing(app_name, false)?;
+    let settings = get_configuration()?;
+    start_replication(settings).await
 }
 
-fn init_tracing() {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "replicator=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-}
-
-fn set_log_level() {
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-}
-
-async fn main_impl() -> Result<(), Box<dyn Error>> {
-    set_log_level();
-    init_tracing();
-
+#[instrument(name = "replication", skip(settings), fields(project = settings.project))]
+async fn start_replication(settings: Settings) -> anyhow::Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install default crypto provider");
 
-    let settings = get_configuration()?;
+    let SourceSettings::Postgres {
+        host,
+        port,
+        name,
+        username,
+        password: _,
+        slot_name,
+        publication,
+    } = &settings.source;
+    info!(
+        host,
+        port,
+        dbname = name,
+        username,
+        slot_name,
+        publication,
+        "source settings"
+    );
 
-    info!("settings: {settings:#?}");
+    let SinkSettings::ClickHouse {
+        url,
+        database,
+        username,
+        password: _,
+    } = &settings.sink;
+
+    info!(url, database, username, "sink settings");
+
+    let BatchSettings {
+        max_size,
+        max_fill_secs,
+    } = &settings.batch;
+    info!(max_size, max_fill_secs, "batch settings");
+
+    let TlsSettings {
+        trusted_root_certs: _,
+        enabled,
+    } = &settings.tls;
+    info!(tls_enabled = enabled, "tls settings");
 
     settings.tls.validate()?;
 
@@ -84,13 +107,17 @@ async fn main_impl() -> Result<(), Box<dyn Error>> {
         SslMode::Disable
     };
 
-    let postgres_source = PostgresSource::new(
-        &host,
+    let options = PgDatabaseOptions {
+        host,
         port,
-        &name,
-        &username,
+        name,
+        username,
         password,
         ssl_mode,
+    };
+
+    let postgres_source = PostgresSource::new(
+        options,
         trusted_root_certs_vec,
         Some(slot_name),
         TableNamesFrom::Publication(publication),

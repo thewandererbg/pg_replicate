@@ -11,8 +11,8 @@ use crate::{
     clients::clickhouse::ClickHouseClient,
     conversions::{cdc_event::CdcEvent, table_row::TableRow, Cell},
     pipeline::PipelineResumptionState,
-    table::{ColumnSchema, TableId, TableName, TableSchema},
 };
+use postgres::schema::{ColumnSchema, TableId, TableName, TableSchema};
 
 use super::{BatchSink, SinkError};
 
