@@ -10,5 +10,4 @@ WORKDIR /app
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/target/release/replicator_clickhouse replicator
-# COPY replicator_clickhouse/configuration configuration
 ENTRYPOINT ["./replicator"]
