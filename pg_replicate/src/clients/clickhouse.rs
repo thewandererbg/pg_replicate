@@ -372,7 +372,10 @@ impl ClickHouseClient {
             Cell::Null => s.push_str("NULL"),
             Cell::Bool(b) => write!(s, "{b}").unwrap(),
             Cell::String(str) => {
-                let escaped = str.replace('\'', "\\'").replace("?", "??");
+                let escaped = str
+                    .replace('\\', "\\\\")
+                    .replace('\'', "\\'")
+                    .replace("?", "??");
                 write!(s, "'{escaped}'").unwrap();
             }
             Cell::I16(i) => write!(s, "{i}").unwrap(),
@@ -388,7 +391,11 @@ impl ClickHouseClient {
             Cell::TimeStampTz(t) => write!(s, "'{}'", t.format("%Y-%m-%dT%H:%M:%S.%6f")).unwrap(),
             Cell::Uuid(u) => write!(s, "'{u}'").unwrap(),
             Cell::Json(j) => {
-                let escaped = j.to_string().replace('\'', "\\'").replace("?", "??");
+                let escaped = j
+                    .to_string()
+                    .replace('\\', "\\\\")
+                    .replace('\'', "\\'")
+                    .replace("?", "??");
                 write!(s, "'{}'", escaped).unwrap();
             }
             Cell::Bytes(b) => {
