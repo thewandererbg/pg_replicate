@@ -159,7 +159,7 @@ impl ClickHouseClient {
         // _version and _is_deleted is meta column of replacingmergetree engine
         // https://clickhouse.com/docs/engines/table-engines/mergetree-family/replacingmergetree
         if engine == "ReplacingMergeTree" {
-            s.push_str("_version UInt64 DEFAULT toUInt64(now64(9))*1000,");
+            s.push_str("_version UInt64 DEFAULT toUnixTimestamp64Micro(now64(6)),");
             s.push_str("_is_deleted UInt8 DEFAULT 0");
         } else {
             s.pop(); // Remove the trailing comma

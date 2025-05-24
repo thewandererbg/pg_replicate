@@ -178,7 +178,7 @@ impl BatchSink for ClickHouseBatchSink {
         });
 
         // Add version and tombstone marker to each row
-        let _version = Utc::now().timestamp_millis();
+        let _version = Utc::now().timestamp_micros();
         for table_row in table_rows.iter_mut() {
             table_row.values.push(Cell::I64(_version));
             table_row.values.push(Cell::I64(0));
@@ -194,14 +194,15 @@ impl BatchSink for ClickHouseBatchSink {
     async fn write_cdc_events(&mut self, events: Vec<CdcEvent>) -> Result<PgLsn, Self::Error> {
         let mut table_name_to_table_rows = HashMap::new();
         let mut new_last_lsn = PgLsn::from(0);
+        let mut _version: i64 = 0;
 
-        let _version = Utc::now().timestamp_millis();
         for event in events {
             // info!("{event:?}");
             match event {
                 CdcEvent::Begin(begin_body) => {
                     let final_lsn_u64 = begin_body.final_lsn();
                     self.final_lsn = Some(final_lsn_u64.into());
+                    _version = begin_body.timestamp() + 946684800000000; // postgre microseconds to unix microseconds
                 }
                 CdcEvent::Commit(commit_body) => {
                     let commit_lsn: PgLsn = commit_body.commit_lsn().into();
