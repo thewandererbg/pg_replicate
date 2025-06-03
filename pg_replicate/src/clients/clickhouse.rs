@@ -421,8 +421,9 @@ impl ClickHouseClient {
     pub async fn get_table_columns(&self, table_name: &str) -> Result<HashSet<String>, CHError> {
         let result: Vec<String> = self
             .client
-            .query("SELECT name FROM system.columns WHERE table = ?")
+            .query("SELECT name FROM system.columns WHERE table = ? AND database = ?")
             .bind(table_name)
+            .bind(&self.database)
             .fetch_all()
             .await?;
 
