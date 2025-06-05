@@ -10,7 +10,5 @@
 //! - `test-utils`: Enables test utilities for both SQLx and tokio-postgres implementations
 
 pub mod schema;
-#[cfg(feature = "sqlx")]
-pub mod sqlx;
 #[cfg(feature = "tokio")]
 pub mod tokio;
