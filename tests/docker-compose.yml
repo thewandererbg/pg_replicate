@@ -11,7 +11,7 @@ services:
       - "5432:5432"
     volumes:
       - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:Z
-    command: postgres -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
+    command: postgres -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10 -c wal_sender_timeout=10s -c wal_receiver_timeout=10s
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
