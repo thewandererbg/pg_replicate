@@ -133,7 +133,7 @@ impl DuckDbExecutor {
                                 truncate_table_fn()
                             }
                             CdcEvent::Relation(_) => Ok(()),
-                            CdcEvent::KeepAliveRequested { reply: _ } => Ok(()),
+                            CdcEvent::KeepAliveRequested(_) => Ok(()),
                             CdcEvent::Type(_) => Ok(()),
                         };
 

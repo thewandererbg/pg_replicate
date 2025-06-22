@@ -161,7 +161,7 @@ impl<Src: Source, Snk: BatchSink> BatchDataPipeline<Src, Snk> {
 
         // Ping the postgresql database each 10s to keep connection alive
         // in case wal_sender_timeout < max_batch_fill_time
-        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut current_lsn = last_lsn.into();
 
@@ -179,8 +179,8 @@ impl<Src: Source, Snk: BatchSink> BatchDataPipeline<Src, Snk> {
                             continue;
                         }
                         let event = event.map_err(CommonSourceError::CdcStream)?;
-                        if let CdcEvent::KeepAliveRequested { reply } = event {
-                            send_status_update = reply;
+                        if let CdcEvent::KeepAliveRequested(keep_alive) = &event {
+                            send_status_update = keep_alive.reply();
                         };
                         events.push(event);
                     }

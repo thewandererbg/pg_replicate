@@ -159,11 +159,30 @@ impl CdcEventConverter {
                 }
                 _ => Err(CdcEventConversionError::UnknownReplicationMessage),
             },
-            ReplicationMessage::PrimaryKeepAlive(keep_alive) => Ok(CdcEvent::KeepAliveRequested {
-                reply: keep_alive.reply() == 1,
-            }),
+            ReplicationMessage::PrimaryKeepAlive(keep_alive) => {
+                Ok(CdcEvent::KeepAliveRequested(KeepAliveBody {
+                    reply: keep_alive.reply() == 1,
+                    wal_end: keep_alive.wal_end(),
+                }))
+            }
             _ => Err(CdcEventConversionError::UnknownReplicationMessage),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct KeepAliveBody {
+    reply: bool,
+    wal_end: u64,
+}
+
+impl KeepAliveBody {
+    pub fn reply(&self) -> bool {
+        self.reply
+    }
+
+    pub fn wal_end(&self) -> u64 {
+        self.wal_end
     }
 }
 
@@ -178,14 +197,11 @@ pub enum CdcEvent {
     Type(TypeBody),
     Origin(OriginBody),
     Truncate(TruncateBody),
-    KeepAliveRequested { reply: bool },
+    KeepAliveRequested(KeepAliveBody),
 }
 
 impl BatchBoundary for CdcEvent {
     fn is_last_in_batch(&self) -> bool {
-        matches!(
-            self,
-            CdcEvent::Commit(_) | CdcEvent::KeepAliveRequested { reply: _ }
-        )
+        matches!(self, CdcEvent::Commit(_) | CdcEvent::KeepAliveRequested(_))
     }
 }

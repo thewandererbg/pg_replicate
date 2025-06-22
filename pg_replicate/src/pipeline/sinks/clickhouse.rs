@@ -271,8 +271,10 @@ impl BatchSink for ClickHouseBatchSink {
                         std::process::exit(0);
                     }
                 }
-
-                CdcEvent::KeepAliveRequested { reply: _ } => {}
+                CdcEvent::KeepAliveRequested(keep_alive) => {
+                    new_last_lsn = keep_alive.wal_end().into();
+                    self.final_lsn = Some(new_last_lsn);
+                }
                 CdcEvent::Type(_) => {}
             }
         }
