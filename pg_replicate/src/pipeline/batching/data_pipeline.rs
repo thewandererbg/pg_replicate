@@ -161,7 +161,7 @@ impl<Src: Source, Snk: BatchSink> BatchDataPipeline<Src, Snk> {
 
         // Ping the postgresql database each 10s to keep connection alive
         // in case wal_sender_timeout < max_batch_fill_time
-        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut current_lsn = last_lsn.into();
 
@@ -206,6 +206,7 @@ impl<Src: Source, Snk: BatchSink> BatchDataPipeline<Src, Snk> {
                     }
                 }
                 _ = ping_interval.tick() => {
+                    info!("ping server with lsn: {current_lsn}");
                     let inner = unsafe {
                         batch_timeout_stream
                             .as_mut()
