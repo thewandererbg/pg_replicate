@@ -1,18 +1,18 @@
 use std::{io::BufReader, time::Duration, vec};
 
 use configuration::{
-    get_configuration, BatchSettings, Settings, SinkSettings, SourceSettings, TlsSettings,
+    get_configuration, BatchSettings, DestinationSettings, Settings, SourceSettings, TlsSettings,
 };
-use pg_replicate::{
+use etl::{
     pipeline::{
         batching::{data_pipeline::BatchDataPipeline, BatchConfig},
-        sinks::clickhouse::ClickHouseBatchSink,
+        destinations::clickhouse::ClickHouseBatchDestination,
         sources::postgres::{PostgresSource, TableNamesFrom},
         PipelineAction,
     },
     SslMode,
 };
-use postgres::tokio::options::PgDatabaseOptions;
+use postgres::tokio::config::PgConnectionConfig;
 use telemetry::init_tracing;
 use tracing::{info, instrument};
 
@@ -56,14 +56,14 @@ async fn start_replication(settings: Settings) -> anyhow::Result<()> {
         "source settings"
     );
 
-    let SinkSettings::ClickHouse {
+    let DestinationSettings::ClickHouse {
         url,
         database,
         username,
         password: _,
-    } = &settings.sink;
+    } = &settings.destination;
 
-    info!(url, database, username, "sink settings");
+    info!(url, database, username, "destination settings");
 
     let BatchSettings {
         max_size,
@@ -107,7 +107,7 @@ async fn start_replication(settings: Settings) -> anyhow::Result<()> {
         SslMode::Disable
     };
 
-    let options = PgDatabaseOptions {
+    let options = PgConnectionConfig {
         host,
         port,
         name,
@@ -124,15 +124,15 @@ async fn start_replication(settings: Settings) -> anyhow::Result<()> {
     )
     .await?;
 
-    let SinkSettings::ClickHouse {
+    let DestinationSettings::ClickHouse {
         url,
         database,
         username,
         password,
-    } = settings.sink;
+    } = settings.destination;
 
-    let clickhouse_sink =
-        ClickHouseBatchSink::new_with_credentials(url, database, username, password).await?;
+    let clickhouse_destination =
+        ClickHouseBatchDestination::new_with_credentials(url, database, username, password).await?;
 
     let BatchSettings {
         max_size,
@@ -142,7 +142,7 @@ async fn start_replication(settings: Settings) -> anyhow::Result<()> {
     let batch_config = BatchConfig::new(max_size, Duration::from_secs(max_fill_secs));
     let mut pipeline = BatchDataPipeline::new(
         postgres_source,
-        clickhouse_sink,
+        clickhouse_destination,
         PipelineAction::Both,
         batch_config,
     );

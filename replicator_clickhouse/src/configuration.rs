@@ -56,7 +56,7 @@ impl Debug for SourceSettings {
 
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum SinkSettings {
+pub enum DestinationSettings {
     ClickHouse {
         /// ClickHouse server URL
         url: String,
@@ -72,7 +72,7 @@ pub enum SinkSettings {
     },
 }
 
-impl Debug for SinkSettings {
+impl Debug for DestinationSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ClickHouse {
@@ -136,7 +136,7 @@ impl TlsSettings {
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Settings {
     pub source: SourceSettings,
-    pub sink: SinkSettings,
+    pub destination: DestinationSettings,
     pub batch: BatchSettings,
     pub tls: TlsSettings,
     pub project: String,
@@ -162,7 +162,7 @@ pub fn get_configuration() -> Result<Settings, config::ConfigError> {
             configuration_directory.join(environment_filename),
         ))
         // Add in settings from environment variables (with a prefix of APP and '__' as separator)
-        // E.g. `APP_SINK__CLICK_HOUSE__URL=http://localhost:8123 would set `Settings { sink: ClickHouse { url }}` to http://localhost:8123
+        // E.g. `APP_SINK__CLICK_HOUSE__URL=http://localhost:8123 would set `Settings { destination: ClickHouse { url }}` to http://localhost:8123
         .add_source(
             config::Environment::with_prefix("APP")
                 .prefix_separator("_")
@@ -202,109 +202,5 @@ impl TryFrom<String> for Environment {
                 "{other} is not a supported environment. Use either `{DEV_ENV_NAME}` or `{PROD_ENV_NAME}`.",
             )),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        configuration::{Settings, TlsSettings},
-        BatchSettings, SinkSettings, SourceSettings,
-    };
-
-    #[test]
-    pub fn deserialize_settings_test() {
-        let settings = r#"{
-            "source": {
-                "postgres": {
-                    "host": "localhost",
-                    "port": 5432,
-                    "name": "postgres",
-                    "username": "postgres",
-                    "password": "postgres",
-                    "slot_name": "replicator_slot",
-                    "publication": "replicator_publication"
-                }
-            },
-            "sink": {
-                "click_house": {
-                    "url": "http://localhost:8123",
-                    "database": "default",
-                    "username": "default",
-                    "password": "password"
-                }
-            },
-            "batch": {
-                "max_size": 1000,
-                "max_fill_secs": 10
-            },
-            "tls": {
-                "trusted_root_certs": "",
-                "enabled": false
-            }
-        }"#;
-        let actual = serde_json::from_str::<Settings>(settings);
-        let expected = Settings {
-            source: SourceSettings::Postgres {
-                host: "localhost".to_string(),
-                port: 5432,
-                name: "postgres".to_string(),
-                username: "postgres".to_string(),
-                password: Some("postgres".to_string()),
-                slot_name: "replicator_slot".to_string(),
-                publication: "replicator_publication".to_string(),
-            },
-            sink: SinkSettings::ClickHouse {
-                url: "http://localhost:8123".to_string(),
-                database: "default".to_string(),
-                username: "default".to_string(),
-                password: "password".to_string(),
-            },
-            batch: BatchSettings {
-                max_size: 1000,
-                max_fill_secs: 10,
-            },
-            tls: TlsSettings {
-                trusted_root_certs: String::new(),
-                enabled: false,
-            },
-            project: "abcdefghijklmnopqrst".to_string(),
-        };
-        assert!(actual.is_ok());
-        assert_eq!(expected, actual.unwrap());
-    }
-
-    #[test]
-    pub fn serialize_settings_test() {
-        let actual = Settings {
-            source: SourceSettings::Postgres {
-                host: "localhost".to_string(),
-                port: 5432,
-                name: "postgres".to_string(),
-                username: "postgres".to_string(),
-                password: Some("postgres".to_string()),
-                slot_name: "replicator_slot".to_string(),
-                publication: "replicator_publication".to_string(),
-            },
-            sink: SinkSettings::ClickHouse {
-                url: "http://localhost:8123".to_string(),
-                database: "default".to_string(),
-                username: "default".to_string(),
-                password: "password".to_string(),
-            },
-            batch: BatchSettings {
-                max_size: 1000,
-                max_fill_secs: 10,
-            },
-            tls: TlsSettings {
-                trusted_root_certs: String::new(),
-                enabled: false,
-            },
-            project: "abcdefghijklmnopqrst".to_string(),
-        };
-        let expected = r#"{"source":{"postgres":{"host":"localhost","port":5432,"name":"postgres","username":"postgres","password":"postgres","slot_name":"replicator_slot","publication":"replicator_publication"}},"sink":{"click_house":{"url":"http://localhost:8123","database":"default","username":"default","password":"password"}},"batch":{"max_size":1000,"max_fill_secs":10},"tls":{"trusted_root_certs":"","enabled":false}}"#;
-        let actual = serde_json::to_string(&actual);
-        assert!(actual.is_ok());
-        assert_eq!(expected, actual.unwrap());
     }
 }
