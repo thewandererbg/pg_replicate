@@ -1,4 +1,5 @@
-use api::db::pipelines::{BatchConfig, PipelineConfig};
+use api::db::pipelines::PipelineConfig;
+use config::shared::{BatchConfig, RetryConfig};
 use reqwest::StatusCode;
 
 use crate::{
@@ -15,18 +16,32 @@ use crate::{
 
 pub fn new_pipeline_config() -> PipelineConfig {
     PipelineConfig {
-        config: BatchConfig {
+        publication_name: "publication".to_owned(),
+        batch: BatchConfig {
             max_size: 1000,
-            max_fill_secs: 5,
+            max_fill_ms: 5,
+        },
+        apply_worker_init_retry: RetryConfig {
+            max_attempts: 5,
+            initial_delay_ms: 1000,
+            max_delay_ms: 2000,
+            backoff_factor: 0.5,
         },
     }
 }
 
 pub fn updated_pipeline_config() -> PipelineConfig {
     PipelineConfig {
-        config: BatchConfig {
+        publication_name: "updated_publication".to_owned(),
+        batch: BatchConfig {
             max_size: 2000,
-            max_fill_secs: 10,
+            max_fill_ms: 10,
+        },
+        apply_worker_init_retry: RetryConfig {
+            max_attempts: 10,
+            initial_delay_ms: 2000,
+            max_delay_ms: 4000,
+            backoff_factor: 1.0,
         },
     }
 }
@@ -42,7 +57,6 @@ pub async fn create_pipeline_with_config(
     let pipeline = CreatePipelineRequest {
         source_id,
         destination_id,
-        publication_name: "publication".to_string(),
         config,
     };
     let response = app.create_pipeline(tenant_id, &pipeline).await;
@@ -66,7 +80,6 @@ async fn pipeline_can_be_created() {
     let pipeline = CreatePipelineRequest {
         source_id,
         destination_id,
-        publication_name: "publication".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant_id, &pipeline).await;
@@ -104,7 +117,6 @@ async fn pipeline_with_another_tenants_source_cant_be_created() {
     let pipeline = CreatePipelineRequest {
         source_id: source2_id,
         destination_id: destinaion1_id,
-        publication_name: "publication".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant1_id, &pipeline).await;
@@ -137,7 +149,6 @@ async fn pipeline_with_another_tenants_destination_cant_be_created() {
     let pipeline = CreatePipelineRequest {
         source_id: source1_id,
         destination_id: destination2_id,
-        publication_name: "publication".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant1_id, &pipeline).await;
@@ -158,7 +169,6 @@ async fn an_existing_pipeline_can_be_read() {
     let pipeline = CreatePipelineRequest {
         source_id,
         destination_id,
-        publication_name: "publication".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant_id, &pipeline).await;
@@ -181,8 +191,8 @@ async fn an_existing_pipeline_can_be_read() {
     assert_eq!(&response.tenant_id, tenant_id);
     assert_eq!(response.source_id, source_id);
     assert_eq!(response.destination_id, destination_id);
-    assert!(response.replicator_id != 0);
-    assert_eq!(response.config, pipeline.config);
+    assert_ne!(response.replicator_id, 0);
+    insta::assert_debug_snapshot!(response.config);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -210,7 +220,6 @@ async fn an_existing_pipeline_can_be_updated() {
     let pipeline = CreatePipelineRequest {
         source_id,
         destination_id,
-        publication_name: "publication".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant_id, &pipeline).await;
@@ -226,7 +235,6 @@ async fn an_existing_pipeline_can_be_updated() {
     let updated_config = UpdatePipelineRequest {
         source_id,
         destination_id,
-        publication_name: "updated_publication".to_string(),
         config: updated_pipeline_config(),
     };
     let response = app
@@ -244,8 +252,7 @@ async fn an_existing_pipeline_can_be_updated() {
     assert_eq!(&response.tenant_id, tenant_id);
     assert_eq!(response.source_id, source_id);
     assert_eq!(response.destination_id, destination_id);
-    assert_eq!(response.publication_name, "updated_publication".to_string());
-    assert_eq!(response.config, updated_config.config);
+    insta::assert_debug_snapshot!(response.config);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -271,7 +278,6 @@ async fn pipeline_with_another_tenants_source_cant_be_updated() {
     let pipeline = CreatePipelineRequest {
         source_id: source1_id,
         destination_id: destination1_id,
-        publication_name: "publication".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant1_id, &pipeline).await;
@@ -286,7 +292,6 @@ async fn pipeline_with_another_tenants_source_cant_be_updated() {
     let updated_config = UpdatePipelineRequest {
         source_id: source2_id,
         destination_id: destination1_id,
-        publication_name: "updated_publication".to_string(),
         config: updated_pipeline_config(),
     };
     let response = app
@@ -320,7 +325,6 @@ async fn pipeline_with_another_tenants_destination_cant_be_updated() {
     let pipeline = CreatePipelineRequest {
         source_id: source1_id,
         destination_id: destination1_id,
-        publication_name: "publication".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant1_id, &pipeline).await;
@@ -335,7 +339,6 @@ async fn pipeline_with_another_tenants_destination_cant_be_updated() {
     let updated_config = UpdatePipelineRequest {
         source_id: source1_id,
         destination_id: destination2_id,
-        publication_name: "updated_publication".to_string(),
         config: updated_pipeline_config(),
     };
     let response = app
@@ -358,7 +361,6 @@ async fn a_non_existing_pipeline_cant_be_updated() {
     let updated_config = UpdatePipelineRequest {
         source_id,
         destination_id,
-        publication_name: "publication".to_string(),
         config: updated_pipeline_config(),
     };
     let response = app.update_pipeline(tenant_id, 42, &updated_config).await;
@@ -379,7 +381,6 @@ async fn an_existing_pipeline_can_be_deleted() {
     let pipeline = CreatePipelineRequest {
         source_id,
         destination_id,
-        publication_name: "publication".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant_id, &pipeline).await;
@@ -450,17 +451,15 @@ async fn all_pipelines_can_be_read() {
         .expect("failed to deserialize response");
     for pipeline in response.pipelines {
         if pipeline.id == pipeline1_id {
-            let config = new_pipeline_config();
             assert_eq!(&pipeline.tenant_id, tenant_id);
             assert_eq!(pipeline.source_id, source1_id);
             assert_eq!(pipeline.destination_id, destination1_id);
-            assert_eq!(pipeline.config, config);
+            insta::assert_debug_snapshot!(pipeline.config);
         } else if pipeline.id == pipeline2_id {
-            let config = updated_pipeline_config();
             assert_eq!(&pipeline.tenant_id, tenant_id);
             assert_eq!(pipeline.source_id, source2_id);
             assert_eq!(pipeline.destination_id, destination2_id);
-            assert_eq!(pipeline.config, config);
+            insta::assert_debug_snapshot!(pipeline.config);
         }
     }
 }
@@ -477,7 +476,6 @@ async fn deleting_a_source_cascade_deletes_the_pipeline() {
     let pipeline = CreatePipelineRequest {
         source_id,
         destination_id,
-        publication_name: "publication".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant_id, &pipeline).await;
@@ -507,7 +505,6 @@ async fn deleting_a_destination_cascade_deletes_the_pipeline() {
     let pipeline = CreatePipelineRequest {
         source_id,
         destination_id,
-        publication_name: "publication".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant_id, &pipeline).await;
@@ -538,7 +535,6 @@ async fn duplicate_pipeline_with_same_source_and_destination_cant_be_created() {
     let pipeline = CreatePipelineRequest {
         source_id,
         destination_id,
-        publication_name: "publication".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant_id, &pipeline).await;
@@ -548,7 +544,6 @@ async fn duplicate_pipeline_with_same_source_and_destination_cant_be_created() {
     let duplicate_pipeline = CreatePipelineRequest {
         source_id,
         destination_id,
-        publication_name: "different_publication".to_string(),
         config: updated_pipeline_config(),
     };
     let response = app.create_pipeline(tenant_id, &duplicate_pipeline).await;
@@ -571,7 +566,6 @@ async fn updating_pipeline_to_duplicate_source_destination_combination_fails() {
     let pipeline1 = CreatePipelineRequest {
         source_id: source1_id,
         destination_id,
-        publication_name: "publication1".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant_id, &pipeline1).await;
@@ -581,7 +575,6 @@ async fn updating_pipeline_to_duplicate_source_destination_combination_fails() {
     let pipeline2 = CreatePipelineRequest {
         source_id: source2_id,
         destination_id,
-        publication_name: "publication2".to_string(),
         config: new_pipeline_config(),
     };
     let response = app.create_pipeline(tenant_id, &pipeline2).await;
@@ -595,7 +588,6 @@ async fn updating_pipeline_to_duplicate_source_destination_combination_fails() {
     let updated_config = UpdatePipelineRequest {
         source_id: source1_id, // This would create a duplicate
         destination_id,
-        publication_name: "updated_publication".to_string(),
         config: updated_pipeline_config(),
     };
     let response = app

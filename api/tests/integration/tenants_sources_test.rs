@@ -48,5 +48,5 @@ async fn tenant_and_source_can_be_created() {
     assert_eq!(response.id, source_id);
     assert_eq!(&response.tenant_id, tenant_id);
     assert_eq!(response.name, tenant_source.source_name);
-    assert_eq!(response.config, tenant_source.source_config);
+    insta::assert_debug_snapshot!(response.config);
 }

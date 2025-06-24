@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use thiserror::Error;
 use utoipa::ToSchema;
 
+use crate::db::publications::PublicationsDbError;
 use crate::{
     db::{self, publications::Publication, sources::SourcesDbError, tables::Table},
     encryption::EncryptionKey,
@@ -18,27 +19,30 @@ use crate::{
 
 #[derive(Debug, Error)]
 enum PublicationError {
-    #[error("database error: {0}")]
-    DatabaseError(#[from] sqlx::Error),
-
-    #[error("source with id {0} not found")]
+    #[error("The source with id {0} was not found")]
     SourceNotFound(i64),
 
-    #[error("publication with name {0} not found")]
+    #[error("The publication with name {0} was not found")]
     PublicationNotFound(String),
 
-    #[error("tenant id error: {0}")]
+    #[error(transparent)]
     TenantId(#[from] TenantIdError),
 
-    #[error("sources db error: {0}")]
+    #[error(transparent)]
     SourcesDb(#[from] SourcesDbError),
+
+    #[error(transparent)]
+    PublicationsDb(#[from] PublicationsDbError),
 }
 
 impl PublicationError {
     fn to_message(&self) -> String {
         match self {
             // Do not expose internal database details in error messages
-            PublicationError::DatabaseError(_) => "internal server error".to_string(),
+            PublicationError::SourcesDb(SourcesDbError::Database(_))
+            | PublicationError::PublicationsDb(PublicationsDbError::Database(_)) => {
+                "internal server error".to_string()
+            }
             // Every other message is ok, as they do not divulge sensitive information
             e => e.to_string(),
         }
@@ -48,7 +52,7 @@ impl PublicationError {
 impl ResponseError for PublicationError {
     fn status_code(&self) -> StatusCode {
         match self {
-            PublicationError::DatabaseError(_) | PublicationError::SourcesDb(_) => {
+            PublicationError::SourcesDb(_) | PublicationError::PublicationsDb(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             PublicationError::SourceNotFound(_) | PublicationError::PublicationNotFound(_) => {
@@ -110,7 +114,7 @@ pub async fn create_publication(
         .map(|s| s.config)
         .ok_or(PublicationError::SourceNotFound(source_id))?;
 
-    let options = config.connect_options();
+    let options = config.into_connection_config().with_db();
     let publication = publication.0;
     let publication = Publication {
         name: publication.name,
@@ -148,7 +152,7 @@ pub async fn read_publication(
         .map(|s| s.config)
         .ok_or(PublicationError::SourceNotFound(source_id))?;
 
-    let options = config.connect_options();
+    let options = config.into_connection_config().with_db();
     let publications = db::publications::read_publication(&publication_name, &options)
         .await?
         .ok_or(PublicationError::PublicationNotFound(publication_name))?;
@@ -185,7 +189,7 @@ pub async fn update_publication(
         .map(|s| s.config)
         .ok_or(PublicationError::SourceNotFound(source_id))?;
 
-    let options = config.connect_options();
+    let options = config.into_connection_config().with_db();
     let publication = publication.0;
     let publication = Publication {
         name: publication_name,
@@ -223,7 +227,7 @@ pub async fn delete_publication(
         .map(|s| s.config)
         .ok_or(PublicationError::SourceNotFound(source_id))?;
 
-    let options = config.connect_options();
+    let options = config.into_connection_config().with_db();
     db::publications::drop_publication(&publication_name, &options).await?;
 
     Ok(HttpResponse::Ok().finish())
@@ -254,7 +258,7 @@ pub async fn read_all_publications(
         .map(|s| s.config)
         .ok_or(PublicationError::SourceNotFound(source_id))?;
 
-    let options = config.connect_options();
+    let options = config.into_connection_config().with_db();
     let publications = db::publications::read_all_publications(&options).await?;
     let response = GetPublicationsResponse { publications };
     Ok(Json(response))

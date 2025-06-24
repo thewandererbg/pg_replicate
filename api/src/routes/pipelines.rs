@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use actix_web::{
     delete, get,
     http::{header::ContentType, StatusCode},
@@ -7,85 +5,93 @@ use actix_web::{
     web::{Data, Json, Path},
     HttpRequest, HttpResponse, Responder, ResponseError,
 };
+use config::shared::{
+    DestinationConfig, PipelineConfig as SharedPipelineConfig, ReplicatorConfig,
+    SourceConfig as SharedSourceConfig, StateStoreConfig, SupabaseConfig, TlsConfig,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::sync::Arc;
 use thiserror::Error;
 use utoipa::ToSchema;
 
-use crate::{
-    db::{
-        self,
-        destinations::{destination_exists, Destination, DestinationConfig, DestinationsDbError},
-        images::Image,
-        pipelines::{Pipeline, PipelineConfig},
-        replicators::Replicator,
-        sources::{source_exists, Source, SourceConfig, SourcesDbError},
-    },
-    encryption::EncryptionKey,
-    k8s_client::{HttpK8sClient, K8sClient, K8sError, PodPhase, TRUSTED_ROOT_CERT_CONFIG_MAP_NAME},
-    replicator_config,
-    routes::extract_tenant_id,
+use crate::db;
+use crate::db::destinations::{destination_exists, Destination, DestinationsDbError};
+use crate::db::images::{Image, ImagesDbError};
+use crate::db::pipelines::{Pipeline, PipelineConfig, PipelinesDbError};
+use crate::db::replicators::{Replicator, ReplicatorsDbError};
+use crate::db::sources::{source_exists, Source, SourceConfig, SourcesDbError};
+use crate::encryption::EncryptionKey;
+use crate::k8s_client::{
+    HttpK8sClient, K8sClient, K8sError, PodPhase, TRUSTED_ROOT_CERT_CONFIG_MAP_NAME,
 };
-
-use super::{ErrorMessage, TenantIdError};
+use crate::routes::{extract_tenant_id, ErrorMessage, TenantIdError};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Secrets {
     pub postgres_password: String,
-    pub bigquery_service_account_key: String,
+    pub big_query_service_account_key: Option<String>,
 }
 
 #[derive(Debug, Error)]
 enum PipelineError {
-    #[error("database error: {0}")]
-    DatabaseError(sqlx::Error),
-
-    #[error("pipeline with id {0} not found")]
+    #[error("The pipeline with id {0} was not found")]
     PipelineNotFound(i64),
 
-    #[error("source with id {0} not found")]
+    #[error("The source with id {0} was not found")]
     SourceNotFound(i64),
 
-    #[error("destination with id {0} not found")]
+    #[error("The destination with id {0} was not found")]
     DestinationNotFound(i64),
 
-    #[error("replicator with pipeline id {0} not found")]
+    #[error("The replicator with pipeline id {0} was not found")]
     ReplicatorNotFound(i64),
 
-    #[error("image with replicator id {0} not found")]
+    #[error("The image with replicator id {0} was not found")]
     ImageNotFound(i64),
 
-    #[error("no default image found")]
+    #[error("No default image was found")]
     NoDefaultImageFound,
 
-    #[error("tenant id error: {0}")]
+    #[error(transparent)]
     TenantId(#[from] TenantIdError),
 
     #[error("invalid destination config")]
     InvalidConfig(#[from] serde_json::Error),
 
-    #[error("k8s error: {0}")]
-    K8sError(#[from] K8sError),
+    #[error("A K8s error occurred: {0}")]
+    K8s(#[from] K8sError),
 
-    #[error("sources db error: {0}")]
+    #[error(transparent)]
     SourcesDb(#[from] SourcesDbError),
 
-    #[error("destinations db error: {0}")]
+    #[error(transparent)]
     DestinationsDb(#[from] DestinationsDbError),
 
-    #[error("trusted root certs config not found")]
+    #[error(transparent)]
+    PipelinesDb(PipelinesDbError),
+
+    #[error(transparent)]
+    ReplicatorsDb(#[from] ReplicatorsDbError),
+
+    #[error(transparent)]
+    ImagesDb(#[from] ImagesDbError),
+
+    #[error("The trusted root certs config was not found")]
     TrustedRootCertsConfigMissing,
 
-    #[error("a pipeline already exists for this source and destination combination")]
+    #[error("A pipeline already exists for this source and destination combination")]
     DuplicatePipeline,
 }
 
-impl From<sqlx::Error> for PipelineError {
-    fn from(e: sqlx::Error) -> Self {
-        if db::pipelines::is_duplicate_pipeline_error(&e) {
-            return PipelineError::DuplicatePipeline;
+impl From<PipelinesDbError> for PipelineError {
+    fn from(e: PipelinesDbError) -> Self {
+        match e {
+            PipelinesDbError::Database(e) if db::pipelines::is_duplicate_pipeline_error(&e) => {
+                Self::DuplicatePipeline
+            }
+            e => Self::PipelinesDb(e),
         }
-        PipelineError::DatabaseError(e)
     }
 }
 
@@ -93,7 +99,13 @@ impl PipelineError {
     fn to_message(&self) -> String {
         match self {
             // Do not expose internal database details in error messages
-            PipelineError::DatabaseError(_) => "internal server error".to_string(),
+            PipelineError::SourcesDb(SourcesDbError::Database(_))
+            | PipelineError::DestinationsDb(DestinationsDbError::Database(_))
+            | PipelineError::PipelinesDb(PipelinesDbError::Database(_))
+            | PipelineError::ReplicatorsDb(ReplicatorsDbError::Database(_))
+            | PipelineError::ImagesDb(ImagesDbError::Database(_)) => {
+                "internal server error".to_string()
+            }
             // Every other message is ok, as they do not divulge sensitive information
             e => e.to_string(),
         }
@@ -103,14 +115,16 @@ impl PipelineError {
 impl ResponseError for PipelineError {
     fn status_code(&self) -> StatusCode {
         match self {
-            PipelineError::DatabaseError(_)
-            | PipelineError::InvalidConfig(_)
+            PipelineError::InvalidConfig(_)
             | PipelineError::ReplicatorNotFound(_)
             | PipelineError::ImageNotFound(_)
             | PipelineError::NoDefaultImageFound
             | PipelineError::SourcesDb(_)
             | PipelineError::DestinationsDb(_)
-            | PipelineError::K8sError(_)
+            | PipelineError::PipelinesDb(_)
+            | PipelineError::ReplicatorsDb(_)
+            | PipelineError::ImagesDb(_)
+            | PipelineError::K8s(_)
             | PipelineError::TrustedRootCertsConfigMissing => StatusCode::INTERNAL_SERVER_ERROR,
             PipelineError::PipelineNotFound(_) => StatusCode::NOT_FOUND,
             PipelineError::TenantId(_)
@@ -136,7 +150,6 @@ impl ResponseError for PipelineError {
 pub struct PostPipelineRequest {
     pub source_id: i64,
     pub destination_id: i64,
-    pub publication_name: String,
     pub config: PipelineConfig,
 }
 
@@ -154,7 +167,6 @@ pub struct GetPipelineResponse {
     destination_id: i64,
     destination_name: String,
     replicator_id: i64,
-    publication_name: String,
     config: PipelineConfig,
 }
 
@@ -199,8 +211,7 @@ pub async fn create_pipeline(
         pipeline.source_id,
         pipeline.destination_id,
         image.id,
-        &pipeline.publication_name,
-        &config,
+        config,
     )
     .await?;
 
@@ -231,7 +242,6 @@ pub async fn read_pipeline(
     let response = db::pipelines::read_pipeline(&pool, tenant_id, pipeline_id)
         .await?
         .map(|s| {
-            let config: PipelineConfig = serde_json::from_value(s.config)?;
             Ok::<GetPipelineResponse, serde_json::Error>(GetPipelineResponse {
                 id: s.id,
                 tenant_id: s.tenant_id,
@@ -240,8 +250,7 @@ pub async fn read_pipeline(
                 destination_id: s.destination_id,
                 destination_name: s.destination_name,
                 replicator_id: s.replicator_id,
-                publication_name: s.publication_name,
-                config,
+                config: s.config,
             })
         })
         .transpose()?
@@ -275,7 +284,6 @@ pub async fn update_pipeline(
     let config = &pipeline.config;
     let source_id = pipeline.source_id;
     let destination_id = pipeline.destination_id;
-    let publication_name = pipeline.publication_name;
 
     if !source_exists(&pool, tenant_id, source_id).await? {
         return Err(PipelineError::SourceNotFound(source_id));
@@ -291,7 +299,6 @@ pub async fn update_pipeline(
         pipeline_id,
         source_id,
         destination_id,
-        &publication_name,
         config,
     )
     .await?
@@ -338,9 +345,9 @@ pub async fn read_all_pipelines(
     pool: Data<PgPool>,
 ) -> Result<impl Responder, PipelineError> {
     let tenant_id = extract_tenant_id(&req)?;
+
     let mut pipelines = vec![];
     for pipeline in db::pipelines::read_all_pipelines(&pool, tenant_id).await? {
-        let config: PipelineConfig = serde_json::from_value(pipeline.config)?;
         let pipeline = GetPipelineResponse {
             id: pipeline.id,
             tenant_id: pipeline.tenant_id,
@@ -349,12 +356,13 @@ pub async fn read_all_pipelines(
             destination_id: pipeline.destination_id,
             destination_name: pipeline.destination_name,
             replicator_id: pipeline.replicator_id,
-            publication_name: pipeline.publication_name,
-            config,
+            config: pipeline.config,
         };
         pipelines.push(pipeline);
     }
+
     let response = GetPipelinesResponse { pipelines };
+
     Ok(Json(response))
 }
 
@@ -379,18 +387,29 @@ pub async fn start_pipeline(
     let (pipeline, replicator, image, source, destination) =
         read_data(&pool, tenant_id, pipeline_id, &encryption_key).await?;
 
-    let (secrets, config) = create_configs(
+    // TODO: load actual state store config.
+    let state_store = StateStoreConfig::Memory;
+
+    // We wrap Supabase's related information within its own struct for a clear separation.
+    let supabase_config = SupabaseConfig {
+        project_ref: tenant_id.to_owned(),
+    };
+
+    let secrets = build_secrets(&source.config, &destination.config);
+
+    let replicator_config = build_replicator_config(
         &k8s_client,
         source.config,
+        state_store,
         destination.config,
         pipeline,
-        tenant_id.to_string(),
+        supabase_config,
     )
     .await?;
-    let prefix = create_prefix(tenant_id, replicator.id);
 
+    let prefix = create_prefix(tenant_id, replicator.id);
     create_or_update_secrets(&k8s_client, &prefix, secrets).await?;
-    create_or_update_config(&k8s_client, &prefix, config).await?;
+    create_or_update_config(&k8s_client, &prefix, replicator_config).await?;
     create_or_update_replicator(&k8s_client, &prefix, image.name).await?;
 
     Ok(HttpResponse::Ok().finish())
@@ -503,16 +522,20 @@ async fn read_data(
     let pipeline = db::pipelines::read_pipeline(pool, tenant_id, pipeline_id)
         .await?
         .ok_or(PipelineError::PipelineNotFound(pipeline_id))?;
+
     let replicator = db::replicators::read_replicator_by_pipeline_id(pool, tenant_id, pipeline_id)
         .await?
         .ok_or(PipelineError::ReplicatorNotFound(pipeline_id))?;
+
     let image = db::images::read_image_by_replicator_id(pool, replicator.id)
         .await?
         .ok_or(PipelineError::ImageNotFound(replicator.id))?;
+
     let source_id = pipeline.source_id;
     let source = db::sources::read_source(pool, tenant_id, source_id, encryption_key)
         .await?
         .ok_or(PipelineError::SourceNotFound(source_id))?;
+
     let destination_id = pipeline.destination_id;
     let destination =
         db::destinations::read_destination(pool, tenant_id, destination_id, encryption_key)
@@ -522,81 +545,71 @@ async fn read_data(
     Ok((pipeline, replicator, image, source, destination))
 }
 
-async fn create_configs(
+fn build_secrets(source_config: &SourceConfig, destination_config: &DestinationConfig) -> Secrets {
+    let postgres_password = source_config.password.clone().unwrap_or_default();
+    let mut big_query_service_account_key = None;
+    if let DestinationConfig::BigQuery {
+        service_account_key,
+        ..
+    } = destination_config
+    {
+        big_query_service_account_key = Some(service_account_key.clone());
+    };
+
+    Secrets {
+        postgres_password,
+        big_query_service_account_key,
+    }
+}
+
+async fn build_replicator_config(
     k8s_client: &Arc<HttpK8sClient>,
     source_config: SourceConfig,
+    state_store_config: StateStoreConfig,
     destination_config: DestinationConfig,
     pipeline: Pipeline,
-    project: String,
-) -> Result<(Secrets, replicator_config::Config), PipelineError> {
-    let SourceConfig::Postgres {
-        host,
-        port,
-        name,
-        username,
-        password: postgres_password,
-        slot_name,
-    } = source_config;
-
-    let DestinationConfig::BigQuery {
-        project_id,
-        dataset_id,
-        service_account_key: bigquery_service_account_key,
-        max_staleness_mins,
-    } = destination_config;
-
-    let secrets = Secrets {
-        postgres_password: postgres_password.unwrap_or_default(),
-        bigquery_service_account_key,
-    };
-
-    let publication = pipeline.publication_name;
-    let source_config = replicator_config::SourceConfig::Postgres {
-        host,
-        port,
-        name,
-        username,
-        slot_name,
-        publication,
-    };
-
-    let destination_config = replicator_config::DestinationConfig::BigQuery {
-        project_id,
-        dataset_id,
-        max_staleness_mins,
-    };
-
-    let pipeline_config: PipelineConfig = serde_json::from_value(pipeline.config)?;
-    let batch_config = pipeline_config.config;
-    let batch_config = replicator_config::BatchConfig {
-        max_size: batch_config.max_size,
-        max_fill_secs: batch_config.max_fill_secs,
-    };
-
-    let trusted_root_certs_cm = k8s_client
+    supabase_config: SupabaseConfig,
+) -> Result<ReplicatorConfig, PipelineError> {
+    let trusted_root_certs = k8s_client
         .get_config_map(TRUSTED_ROOT_CERT_CONFIG_MAP_NAME)
-        .await?;
-    let data = trusted_root_certs_cm
+        .await?
         .data
-        .ok_or(PipelineError::TrustedRootCertsConfigMissing)?;
-    let trusted_root_certs = data
+        .ok_or(PipelineError::TrustedRootCertsConfigMissing)?
         .get("trusted_root_certs")
-        .ok_or(PipelineError::TrustedRootCertsConfigMissing)?;
+        .ok_or(PipelineError::TrustedRootCertsConfigMissing)?
+        .clone();
 
-    let tls_config = replicator_config::TlsConfig {
-        trusted_root_certs: trusted_root_certs.clone(),
-        enabled: true,
+    let source_config = SharedSourceConfig {
+        host: source_config.host,
+        port: source_config.port,
+        name: source_config.name,
+        username: source_config.username,
+        password: source_config.password,
+        tls: TlsConfig {
+            trusted_root_certs,
+            enabled: true,
+        },
     };
 
-    let config = replicator_config::Config {
+    let pipeline_config = SharedPipelineConfig {
+        // We are safe to perform this conversion, since the i64 -> u64 conversion performs wrap
+        // around, and we won't have two different values map to the same u64, since the domain size
+        // is the same.
+        id: pipeline.id as u64,
+        publication_name: pipeline.config.publication_name,
+        batch: pipeline.config.batch,
+        apply_worker_init_retry: pipeline.config.apply_worker_init_retry,
+    };
+
+    let config = ReplicatorConfig {
         source: source_config,
+        state_store: state_store_config,
         destination: destination_config,
-        batch: batch_config,
-        tls: tls_config,
-        project,
+        pipeline: pipeline_config,
+        supabase: Some(supabase_config),
     };
 
-    Ok((secrets, config))
+    Ok(config)
 }
 
 fn create_prefix(tenant_id: &str, replicator_id: i64) -> String {
@@ -611,16 +624,20 @@ async fn create_or_update_secrets(
     k8s_client
         .create_or_update_postgres_secret(prefix, &secrets.postgres_password)
         .await?;
-    k8s_client
-        .create_or_update_bq_secret(prefix, &secrets.bigquery_service_account_key)
-        .await?;
+
+    if let Some(bigquery_service_account_key) = secrets.big_query_service_account_key {
+        k8s_client
+            .create_or_update_bq_secret(prefix, &bigquery_service_account_key)
+            .await?;
+    }
+
     Ok(())
 }
 
 async fn create_or_update_config(
     k8s_client: &Arc<HttpK8sClient>,
     prefix: &str,
-    config: replicator_config::Config,
+    config: ReplicatorConfig,
 ) -> Result<(), PipelineError> {
     let base_config = "";
     let prod_config = serde_json::to_string(&config)?;

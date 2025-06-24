@@ -1,199 +1,91 @@
-use aws_lc_rs::{aead::Nonce, error::Unspecified};
-use base64::{prelude::BASE64_STANDARD, DecodeError, Engine};
-use serde_json::Value;
-use sqlx::{
-    postgres::{PgConnectOptions, PgSslMode},
-    PgPool, Postgres, Transaction,
-};
-use std::{
-    fmt::{Debug, Formatter},
-    str::{from_utf8, Utf8Error},
-};
+use postgres::sqlx::config::PgConnectionConfig;
+use secrecy::Secret;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Postgres, Transaction};
+use std::fmt::Debug;
 use thiserror::Error;
 
-use crate::encryption::{decrypt, encrypt, EncryptedValue, EncryptionKey};
+use crate::db::serde::{
+    decrypt_and_deserialize_from_value, encrypt_and_serialize, DbDeserializationError,
+    DbSerializationError,
+};
+use crate::encryption::{
+    decrypt_text, encrypt_text, Decrypt, DecryptionError, Encrypt, EncryptedValue, EncryptionError,
+    EncryptionKey,
+};
 
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SourceConfigInDb {
-    Postgres {
-        /// Host on which Postgres is running
-        host: String,
-
-        /// Port on which Postgres is running
-        port: u16,
-
-        /// Postgres database name
-        name: String,
-
-        /// Postgres database user name
-        username: String,
-
-        /// Postgres database user password
-        password: Option<EncryptedValue>,
-
-        /// Postgres slot name
-        slot_name: String,
-    },
-}
-
-impl SourceConfigInDb {
-    fn into_config(self, encryption_key: &EncryptionKey) -> Result<SourceConfig, SourcesDbError> {
-        let SourceConfigInDb::Postgres {
-            host,
-            port,
-            name,
-            username,
-            password: encrypted_password,
-            slot_name,
-        } = self;
-
-        let decrypted_password = encrypted_password
-            .map(|encrypted_password| {
-                if encrypted_password.id != encryption_key.id {
-                    return Err(SourcesDbError::MismatchedKeyId(
-                        encrypted_password.id,
-                        encryption_key.id,
-                    ));
-                }
-                let encrypted_password_bytes = BASE64_STANDARD.decode(encrypted_password.value)?;
-                let nonce = Nonce::try_assume_unique_for_key(
-                    &BASE64_STANDARD.decode(encrypted_password.nonce)?,
-                )?;
-                let decrypted_password = from_utf8(&decrypt(
-                    encrypted_password_bytes,
-                    nonce,
-                    &encryption_key.key,
-                )?)?
-                .to_string();
-                Ok(decrypted_password)
-            })
-            .transpose()?;
-
-        Ok(SourceConfig::Postgres {
-            host,
-            port,
-            name,
-            username,
-            password: decrypted_password,
-            slot_name,
-        })
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceConfig {
-    Postgres {
-        /// Host on which Postgres is running
-        host: String,
-
-        /// Port on which Postgres is running
-        port: u16,
-
-        /// Postgres database name
-        name: String,
-
-        /// Postgres database user name
-        username: String,
-
-        /// Postgres database user password
-        password: Option<String>,
-
-        /// Postgres slot name
-        slot_name: String,
-    },
+pub struct SourceConfig {
+    pub host: String,
+    pub port: u16,
+    pub name: String,
+    pub username: String,
+    pub password: Option<String>,
 }
 
 impl SourceConfig {
-    pub fn connect_options(&self) -> PgConnectOptions {
-        match self {
-            SourceConfig::Postgres {
-                host,
-                port,
-                name,
-                username,
-                password,
-                slot_name: _,
-            } => {
-                let ssl_mode = PgSslMode::Prefer;
-
-                let options = PgConnectOptions::new_without_pgpass()
-                    .host(host)
-                    .port(*port)
-                    .database(name)
-                    .username(username)
-                    .ssl_mode(ssl_mode);
-                if let Some(password) = password {
-                    options.password(password)
-                } else {
-                    options
-                }
-            }
+    pub fn into_connection_config(self) -> PgConnectionConfig {
+        PgConnectionConfig {
+            host: self.host,
+            port: self.port,
+            name: self.name,
+            username: self.username,
+            password: self.password.map(Secret::new),
+            // TODO: check whether we want to require ssl.
+            require_ssl: false,
         }
     }
+}
 
-    pub fn into_db_config(
+impl Encrypt<EncryptedSourceConfig> for SourceConfig {
+    fn encrypt(
         self,
         encryption_key: &EncryptionKey,
-    ) -> Result<SourceConfigInDb, Unspecified> {
-        let SourceConfig::Postgres {
-            host,
-            port,
-            name,
-            username,
-            password,
-            slot_name,
-        } = self;
+    ) -> Result<EncryptedSourceConfig, EncryptionError> {
+        let mut encrypted_password = None;
+        if let Some(password) = self.password {
+            encrypted_password = Some(encrypt_text(password, encryption_key)?);
+        }
 
-        let encrypted_password = password
-            .map(|password| {
-                let (encrypted_password, nonce) =
-                    encrypt(password.as_bytes(), &encryption_key.key)?;
-                let encrypted_encoded_password = BASE64_STANDARD.encode(encrypted_password);
-                let encoded_nonce = BASE64_STANDARD.encode(nonce.as_ref());
-                Ok::<EncryptedValue, Unspecified>(EncryptedValue {
-                    id: encryption_key.id,
-                    nonce: encoded_nonce,
-                    value: encrypted_encoded_password,
-                })
-            })
-            .transpose()?;
-
-        Ok(SourceConfigInDb::Postgres {
-            host,
-            port,
-            name,
-            username,
+        Ok(EncryptedSourceConfig {
+            host: self.host,
+            port: self.port,
+            name: self.name,
+            username: self.username,
             password: encrypted_password,
-            slot_name,
         })
     }
 }
 
-impl Debug for SourceConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SourceConfig::Postgres {
-                host,
-                port,
-                name,
-                username,
-                password: _,
-                slot_name,
-            } => f
-                .debug_struct("Postgres")
-                .field("host", host)
-                .field("port", port)
-                .field("name", name)
-                .field("username", username)
-                .field("password", &"REDACTED")
-                .field("slot_name", slot_name)
-                .finish(),
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct EncryptedSourceConfig {
+    host: String,
+    port: u16,
+    name: String,
+    username: String,
+    password: Option<EncryptedValue>,
+}
+
+impl Decrypt<SourceConfig> for EncryptedSourceConfig {
+    fn decrypt(self, encryption_key: &EncryptionKey) -> Result<SourceConfig, DecryptionError> {
+        let mut decrypted_password = None;
+        if let Some(password) = self.password {
+            decrypted_password = Some(decrypt_text(password, encryption_key)?);
         }
+
+        Ok(SourceConfig {
+            host: self.host,
+            port: self.port,
+            name: self.name,
+            username: self.username,
+            password: decrypted_password,
+        })
     }
 }
 
+#[derive(Debug)]
 pub struct Source {
     pub id: i64,
     pub tenant_id: String,
@@ -203,23 +95,14 @@ pub struct Source {
 
 #[derive(Debug, Error)]
 pub enum SourcesDbError {
-    #[error("sqlx error: {0}")]
-    Sqlx(#[from] sqlx::Error),
+    #[error("Error while interacting with PostgreSQL for sources: {0}")]
+    Database(#[from] sqlx::Error),
 
-    #[error("encryption error: {0}")]
-    Encryption(#[from] Unspecified),
+    #[error("Error while serializing source config: {0}")]
+    DbSerialization(#[from] DbSerializationError),
 
-    #[error("invalid source config in db")]
-    InvalidConfig(#[from] serde_json::Error),
-
-    #[error("mismatched key id. Expected: {0}, actual: {1}")]
-    MismatchedKeyId(u32, u32),
-
-    #[error("base64 decode error: {0}")]
-    Base64Decode(#[from] DecodeError),
-
-    #[error("utf8 error: {0}")]
-    Utf8(#[from] Utf8Error),
+    #[error("Error while deserializing source config: {0}")]
+    DbDeserialization(#[from] DbDeserializationError),
 }
 
 pub async fn create_source(
@@ -229,11 +112,13 @@ pub async fn create_source(
     config: SourceConfig,
     encryption_key: &EncryptionKey,
 ) -> Result<i64, SourcesDbError> {
-    let db_config = config.into_db_config(encryption_key)?;
-    let db_config = serde_json::to_value(db_config).expect("failed to serialize config");
+    let config =
+        encrypt_and_serialize::<SourceConfig, EncryptedSourceConfig>(config, encryption_key)?;
+
     let mut txn = pool.begin().await?;
-    let res = create_source_txn(&mut txn, tenant_id, name, db_config).await;
+    let res = create_source_txn(&mut txn, tenant_id, name, config).await;
     txn.commit().await?;
+
     res
 }
 
@@ -241,7 +126,7 @@ pub async fn create_source_txn(
     txn: &mut Transaction<'_, Postgres>,
     tenant_id: &str,
     name: &str,
-    db_config: Value,
+    config: serde_json::Value,
 ) -> Result<i64, SourcesDbError> {
     let record = sqlx::query!(
         r#"
@@ -251,7 +136,7 @@ pub async fn create_source_txn(
         "#,
         tenant_id,
         name,
-        db_config
+        config
     )
     .fetch_one(&mut **txn)
     .await?;
@@ -277,19 +162,23 @@ pub async fn read_source(
     .fetch_optional(pool)
     .await?;
 
-    let source = record
-        .map(|r| {
-            let config: SourceConfigInDb = serde_json::from_value(r.config)?;
-            let config = config.into_config(encryption_key)?;
-            let source = Source {
-                id: r.id,
-                tenant_id: r.tenant_id,
-                name: r.name,
+    let source = match record {
+        Some(record) => {
+            let config = decrypt_and_deserialize_from_value::<EncryptedSourceConfig, SourceConfig>(
+                record.config,
+                encryption_key,
+            )?;
+
+            Some(Source {
+                id: record.id,
+                tenant_id: record.tenant_id,
+                name: record.name,
                 config,
-            };
-            Ok::<Source, SourcesDbError>(source)
-        })
-        .transpose()?;
+            })
+        }
+        None => None,
+    };
+
     Ok(source)
 }
 
@@ -301,8 +190,9 @@ pub async fn update_source(
     config: SourceConfig,
     encryption_key: &EncryptionKey,
 ) -> Result<Option<i64>, SourcesDbError> {
-    let db_config = config.into_db_config(encryption_key)?;
-    let db_config = serde_json::to_value(db_config).expect("failed to serialize config");
+    let config =
+        encrypt_and_serialize::<SourceConfig, EncryptedSourceConfig>(config, encryption_key)?;
+
     let record = sqlx::query!(
         r#"
         update app.sources
@@ -310,7 +200,7 @@ pub async fn update_source(
         where tenant_id = $3 and id = $4
         returning id
         "#,
-        db_config,
+        config,
         name,
         tenant_id,
         source_id
@@ -325,7 +215,7 @@ pub async fn delete_source(
     pool: &PgPool,
     tenant_id: &str,
     source_id: i64,
-) -> Result<Option<i64>, sqlx::Error> {
+) -> Result<Option<i64>, SourcesDbError> {
     let record = sqlx::query!(
         r#"
         delete from app.sources
@@ -359,8 +249,10 @@ pub async fn read_all_sources(
 
     let mut sources = Vec::with_capacity(records.len());
     for record in records {
-        let config: SourceConfigInDb = serde_json::from_value(record.config)?;
-        let config = config.into_config(encryption_key)?;
+        let config = decrypt_and_deserialize_from_value::<EncryptedSourceConfig, SourceConfig>(
+            record.config.clone(),
+            encryption_key,
+        )?;
         let source = Source {
             id: record.id,
             tenant_id: record.tenant_id,
@@ -377,7 +269,7 @@ pub async fn source_exists(
     pool: &PgPool,
     tenant_id: &str,
     source_id: i64,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, SourcesDbError> {
     let record = sqlx::query!(
         r#"
         select exists (select id
@@ -395,46 +287,68 @@ pub async fn source_exists(
 
 #[cfg(test)]
 mod tests {
-    use crate::db::sources::SourceConfig;
+    use aws_lc_rs::aead::RandomizedNonceKey;
+    use serde_json;
+
+    use crate::db::serde::{decrypt_and_deserialize_from_value, encrypt_and_serialize};
+    use crate::db::sources::{EncryptedSourceConfig, SourceConfig};
+    use crate::encryption::EncryptionKey;
 
     #[test]
-    pub fn deserialize_settings_test() {
-        let settings = r#"{
-            "postgres": {
-                "host": "localhost",
-                "port": 5432,
-                "name": "postgres",
-                "username": "postgres",
-                "password": "postgres",
-                "slot_name": "slot"
-            }
+    pub fn source_config_json_deserialization() {
+        let config = r#"{
+            "host": "localhost",
+            "port": 5432,
+            "name": "postgres",
+            "username": "postgres",
+            "password": "postgres"
         }"#;
-        let actual = serde_json::from_str::<SourceConfig>(settings);
-        let expected = SourceConfig::Postgres {
-            host: "localhost".to_string(),
-            port: 5432,
-            name: "postgres".to_string(),
-            username: "postgres".to_string(),
-            password: Some("postgres".to_string()),
-            slot_name: "slot".to_string(),
-        };
-        assert!(actual.is_ok());
-        assert_eq!(expected, actual.unwrap());
+
+        let deserialized = serde_json::from_str::<SourceConfig>(config);
+        insta::assert_debug_snapshot!(deserialized.unwrap());
     }
 
     #[test]
-    pub fn serialize_settings_test() {
-        let actual = SourceConfig::Postgres {
+    pub fn source_config_json_serialization() {
+        let config = SourceConfig {
             host: "localhost".to_string(),
             port: 5432,
             name: "postgres".to_string(),
             username: "postgres".to_string(),
             password: Some("postgres".to_string()),
-            slot_name: "slot".to_string(),
         };
-        let expected = r#"{"postgres":{"host":"localhost","port":5432,"name":"postgres","username":"postgres","password":"postgres","slot_name":"slot"}}"#;
-        let actual = serde_json::to_string(&actual);
-        assert!(actual.is_ok());
-        assert_eq!(expected, actual.unwrap());
+
+        insta::assert_json_snapshot!(config);
+    }
+
+    #[test]
+    pub fn source_config_json_encryption() {
+        let key_bytes = [42u8; 32];
+        let key = RandomizedNonceKey::new(&aws_lc_rs::aead::AES_256_GCM, &key_bytes).unwrap();
+        let encryption_key = EncryptionKey { id: 1, key };
+
+        let config = SourceConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            name: "postgres".to_string(),
+            username: "postgres".to_string(),
+            password: Some("supersecret".to_string()),
+        };
+
+        let config_in_db = encrypt_and_serialize::<SourceConfig, EncryptedSourceConfig>(
+            config.clone(),
+            &encryption_key,
+        )
+        .unwrap();
+        insta::assert_json_snapshot!(config_in_db, {
+            ".password" => "[password]"
+        });
+
+        let deserialized_config = decrypt_and_deserialize_from_value::<
+            EncryptedSourceConfig,
+            SourceConfig,
+        >(config_in_db, &encryption_key)
+        .unwrap();
+        insta::assert_debug_snapshot!(deserialized_config);
     }
 }

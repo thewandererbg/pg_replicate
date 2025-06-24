@@ -10,12 +10,11 @@ use thiserror::Error;
 use tracing_actix_web::RootSpan;
 use utoipa::ToSchema;
 
-use crate::{
-    db::{self, sources::SourceConfig, tenants_sources::TenantSourceDbError},
-    encryption::EncryptionKey,
-};
-
-use super::ErrorMessage;
+use crate::db;
+use crate::db::sources::SourceConfig;
+use crate::db::tenants_sources::TenantSourceDbError;
+use crate::encryption::EncryptionKey;
+use crate::routes::ErrorMessage;
 
 #[derive(Deserialize, ToSchema)]
 pub struct CreateTenantSourceRequest {
@@ -34,14 +33,19 @@ pub struct CreateTenantSourceRequest {
 
 #[derive(Debug, Error)]
 enum TenantSourceError {
-    #[error("tenants and sources db error: {0}")]
+    #[error(transparent)]
     TenantSourceDb(#[from] TenantSourceDbError),
 }
 
 impl TenantSourceError {
     fn to_message(&self) -> String {
         match self {
-            TenantSourceError::TenantSourceDb(_) => "internal server error".to_string(),
+            // Do not expose internal database details in error messages
+            TenantSourceError::TenantSourceDb(TenantSourceDbError::Database(_)) => {
+                "internal server error".to_string()
+            }
+            // Every other message is ok, as they do not divulge sensitive information
+            e => e.to_string(),
         }
     }
 }
@@ -49,11 +53,7 @@ impl TenantSourceError {
 impl ResponseError for TenantSourceError {
     fn status_code(&self) -> StatusCode {
         match self {
-            TenantSourceError::TenantSourceDb(e) => match e {
-                TenantSourceDbError::Sqlx(_)
-                | TenantSourceDbError::Sources(_)
-                | TenantSourceDbError::Encryption(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            },
+            TenantSourceError::TenantSourceDb(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 

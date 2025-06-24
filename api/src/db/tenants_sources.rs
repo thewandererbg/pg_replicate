@@ -1,24 +1,24 @@
-use aws_lc_rs::error::Unspecified;
 use sqlx::PgPool;
 use thiserror::Error;
 
+use crate::db::serde::{encrypt_and_serialize, DbSerializationError};
+use crate::db::sources::{create_source_txn, SourceConfig, SourcesDbError};
+use crate::db::tenants::{create_tenant_txn, TenantsDbError};
 use crate::encryption::EncryptionKey;
-
-use super::{
-    sources::{create_source_txn, SourceConfig, SourcesDbError},
-    tenants::create_tenant_txn,
-};
 
 #[derive(Debug, Error)]
 pub enum TenantSourceDbError {
-    #[error("sqlx error: {0}")]
-    Sqlx(#[from] sqlx::Error),
+    #[error("Error while interacting with PostgreSQL for tenants and/or sources: {0}")]
+    Database(#[from] sqlx::Error),
 
-    #[error("encryption error: {0}")]
-    Encryption(#[from] Unspecified),
+    #[error("Error while serializing tenant or source config: {0}")]
+    DbSerialization(#[from] DbSerializationError),
 
-    #[error("sources error: {0}")]
+    #[error(transparent)]
     Sources(#[from] SourcesDbError),
+
+    #[error(transparent)]
+    Tenants(#[from] TenantsDbError),
 }
 
 pub async fn create_tenant_and_source(
@@ -29,11 +29,12 @@ pub async fn create_tenant_and_source(
     source_config: SourceConfig,
     encryption_key: &EncryptionKey,
 ) -> Result<(String, i64), TenantSourceDbError> {
-    let db_config = source_config.into_db_config(encryption_key)?;
-    let db_config = serde_json::to_value(db_config).expect("failed to serialize config");
+    let source_config = encrypt_and_serialize(source_config, encryption_key)?;
+
     let mut txn = pool.begin().await?;
     let tenant_id = create_tenant_txn(&mut txn, tenant_id, tenant_name).await?;
-    let source_id = create_source_txn(&mut txn, &tenant_id, source_name, db_config).await?;
+    let source_id = create_source_txn(&mut txn, &tenant_id, source_name, source_config).await?;
     txn.commit().await?;
+
     Ok((tenant_id, source_id))
 }

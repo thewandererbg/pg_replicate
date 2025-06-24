@@ -14,13 +14,12 @@ pub fn new_name() -> String {
 }
 
 pub fn new_source_config() -> SourceConfig {
-    SourceConfig::Postgres {
+    SourceConfig {
         host: "localhost".to_string(),
         port: 5432,
         name: "postgres".to_string(),
         username: "postgres".to_string(),
         password: Some("postgres".to_string()),
-        slot_name: "slot".to_string(),
     }
 }
 
@@ -29,13 +28,12 @@ fn updated_name() -> String {
 }
 
 fn updated_source_config() -> SourceConfig {
-    SourceConfig::Postgres {
+    SourceConfig {
         host: "example.com".to_string(),
         port: 2345,
         name: "sergtsop".to_string(),
         username: "sergtsop".to_string(),
         password: Some("sergtsop".to_string()),
-        slot_name: "tols".to_string(),
     }
 }
 
@@ -109,7 +107,7 @@ async fn an_existing_source_can_be_read() {
     assert_eq!(response.id, source_id);
     assert_eq!(&response.tenant_id, tenant_id);
     assert_eq!(response.name, source.name);
-    assert_eq!(response.config, source.config);
+    insta::assert_debug_snapshot!(response.config);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -161,7 +159,7 @@ async fn an_existing_source_can_be_updated() {
     assert_eq!(response.id, source_id);
     assert_eq!(&response.tenant_id, tenant_id);
     assert_eq!(response.name, updated_config.name);
-    assert_eq!(response.config, updated_config.config);
+    insta::assert_debug_snapshot!(response.config);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -242,16 +240,14 @@ async fn all_sources_can_be_read() {
     for source in response.sources {
         if source.id == source1_id {
             let name = new_name();
-            let config = new_source_config();
             assert_eq!(&source.tenant_id, tenant_id);
             assert_eq!(source.name, name);
-            assert_eq!(source.config, config);
+            insta::assert_debug_snapshot!(source.config);
         } else if source.id == source2_id {
             let name = updated_name();
-            let config = updated_source_config();
             assert_eq!(&source.tenant_id, tenant_id);
             assert_eq!(source.name, name);
-            assert_eq!(source.config, config);
+            insta::assert_debug_snapshot!(source.config);
         }
     }
 }
