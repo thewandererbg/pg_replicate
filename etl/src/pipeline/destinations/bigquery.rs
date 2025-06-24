@@ -92,7 +92,11 @@ impl BigQueryBatchDestination {
     }
 
     fn table_name_in_bq(table_name: &TableName) -> String {
-        format!("{}_{}", table_name.schema, table_name.name)
+        if table_name.schema == "public" {
+            format!("{}", table_name.name)
+        } else {
+            format!("{}_{}", table_name.schema, table_name.name)
+        }
     }
 }
 
@@ -112,7 +116,7 @@ impl BatchDestination for BigQueryBatchDestination {
         self.client
             .create_table_if_missing(
                 &self.dataset_id,
-                "copied_tables",
+                "_copied_tables",
                 &copied_table_column_schemas,
                 self.max_staleness_mins,
             )
@@ -138,7 +142,7 @@ impl BatchDestination for BigQueryBatchDestination {
             .client
             .create_table_if_missing(
                 &self.dataset_id,
-                "last_lsn",
+                "_last_lsn",
                 &last_lsn_column_schemas,
                 self.max_staleness_mins,
             )

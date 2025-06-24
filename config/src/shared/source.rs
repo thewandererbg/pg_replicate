@@ -21,6 +21,8 @@ pub struct SourceConfig {
     pub password: Option<String>,
     /// TLS configuration for secure connections.
     pub tls: TlsConfig,
+    /// Slotname
+    pub slot_name: String,
 }
 
 impl fmt::Debug for SourceConfig {

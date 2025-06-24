@@ -7,6 +7,13 @@ edition = "2024"
 pg_escape = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 secrecy = { workspace = true, features = ["serde", "alloc"] }
+sqlx = { workspace = true, features = [
+    "runtime-tokio-rustls",
+    "macros",
+    "postgres",
+    "json",
+    "migrate",
+] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tokio-postgres = { workspace = true, features = [
     "runtime",

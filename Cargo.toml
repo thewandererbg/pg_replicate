@@ -1,12 +1,23 @@
 [workspace]
 resolver = "2"
 
-members = ["etl", "postgres", "replicator_clickhouse", "telemetry"]
+members = [
+    "config",
+    "etl",
+    "postgres",
+    "replicator",
+    "replicator_clickhouse",
+    "replicator_bigquery",
+    "telemetry",
+]
 
 [workspace.dependencies]
+config = { path = "config" }
 etl = { path = "etl" }
 postgres = { path = "postgres" }
+replicator = { path = "replicator" }
 replicator_clickhouse = { path = "replicator_clickhouse" }
+replicator_bigquery = { path = "replicator_bigquery" }
 telemetry = { path = "telemetry" }
 
 actix-web = { version = "4", default-features = false }
@@ -42,6 +53,7 @@ rustyline = { version = "14.0.0", default-features = false }
 secrecy = { version = "0.8.0", default-features = false }
 serde = { version = "1.0", default-features = false }
 serde_json = { version = "1.0", default-features = false }
+sqlx = { version = "0.8.2", default-features = false }
 thiserror = "1.0"
 tokio = { version = "1.38", default-features = false }
 tokio-postgres = { git = "https://github.com/imor/rust-postgres", default-features = false, rev = "20265ef38e32a06f76b6f9b678e2077fc2211f6b" }
@@ -59,4 +71,3 @@ uuid = { version = "1.10.0", default-features = false }
 # gcp-bigquery-client = { path = "../gcp-bigquery-client" }
 
 clickhouse = { version = "0.13.2", default-features = false }
-config = { version = "0.14", default-features = false }

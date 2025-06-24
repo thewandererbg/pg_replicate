@@ -75,7 +75,7 @@ impl BigQueryClient {
             &Type::CHAR | &Type::BPCHAR | &Type::VARCHAR | &Type::NAME | &Type::TEXT => "string",
             &Type::INT2 | &Type::INT4 | &Type::INT8 => "int64",
             &Type::FLOAT4 | &Type::FLOAT8 => "float64",
-            &Type::NUMERIC => "bignumeric",
+            &Type::NUMERIC => "float64",
             &Type::DATE => "date",
             &Type::TIME => "time",
             &Type::TIMESTAMP | &Type::TIMESTAMPTZ => "timestamp",
@@ -91,7 +91,7 @@ impl BigQueryClient {
             | &Type::TEXT_ARRAY => "array<string>",
             &Type::INT2_ARRAY | &Type::INT4_ARRAY | &Type::INT8_ARRAY => "array<int64>",
             &Type::FLOAT4_ARRAY | &Type::FLOAT8_ARRAY => "array<float64>",
-            &Type::NUMERIC_ARRAY => "array<bignumeric>",
+            &Type::NUMERIC_ARRAY => "array<float64>",
             &Type::DATE_ARRAY => "array<date>",
             &Type::TIME_ARRAY => "array<time>",
             &Type::TIMESTAMP_ARRAY | &Type::TIMESTAMPTZ_ARRAY => "array<timestamp>",
@@ -183,6 +183,14 @@ impl BigQueryClient {
         format!("options (max_staleness = interval {max_staleness_mins} minute)")
     }
 
+    fn partition_option(column_schemas: &[ColumnSchema]) -> String {
+        if column_schemas.iter().any(|col| col.name == "created_at") {
+            "PARTITION BY DATE(created_at)".to_string()
+        } else {
+            "".to_string()
+        }
+    }
+
     pub async fn create_table(
         &self,
         dataset_id: &str,
@@ -192,10 +200,12 @@ impl BigQueryClient {
     ) -> Result<(), BQError> {
         let columns_spec = Self::create_columns_spec(column_schemas);
         let max_staleness_option = Self::max_staleness_option(max_staleness_mins);
+        let partition_option = Self::partition_option(column_schemas);
         let project_id = &self.project_id;
         info!("creating table {project_id}.{dataset_id}.{table_name} in bigquery");
         let query =
-            format!("create table `{project_id}.{dataset_id}.{table_name}` {columns_spec} {max_staleness_option}",);
+            format!("create table `{project_id}.{dataset_id}.{table_name}` {columns_spec} {partition_option} {max_staleness_option}",);
+
         let _ = self.query(query).await?;
         Ok(())
     }
@@ -243,7 +253,7 @@ impl BigQueryClient {
 
     pub async fn get_last_lsn(&self, dataset_id: &str) -> Result<PgLsn, BQError> {
         let project_id = &self.project_id;
-        let query = format!("select lsn from `{project_id}.{dataset_id}.last_lsn`",);
+        let query = format!("select lsn from `{project_id}.{dataset_id}._last_lsn`",);
 
         let mut rs = self.query(query).await?;
 
@@ -263,7 +273,7 @@ impl BigQueryClient {
 
         let project_id = &self.project_id;
         let query =
-            format!("update `{project_id}.{dataset_id}.last_lsn` set lsn = {lsn} where id = 1",);
+            format!("update `{project_id}.{dataset_id}._last_lsn` set lsn = {lsn} where id = 1",);
 
         let _ = self.query(query).await?;
 
@@ -273,7 +283,7 @@ impl BigQueryClient {
     pub async fn insert_last_lsn_row(&self, dataset_id: &str) -> Result<(), BQError> {
         let project_id = &self.project_id;
         let query =
-            format!("insert into `{project_id}.{dataset_id}.last_lsn` (id, lsn) values (1, 0)",);
+            format!("insert into `{project_id}.{dataset_id}._last_lsn` (id, lsn) values (1, 0)",);
 
         let _ = self.query(query).await?;
 
@@ -285,7 +295,7 @@ impl BigQueryClient {
         dataset_id: &str,
     ) -> Result<HashSet<TableId>, BQError> {
         let project_id = &self.project_id;
-        let query = format!("select table_id from `{project_id}.{dataset_id}.copied_tables`",);
+        let query = format!("select table_id from `{project_id}.{dataset_id}._copied_tables`",);
 
         let mut rs = self.query(query).await?;
         let mut table_ids = HashSet::new();
@@ -306,7 +316,7 @@ impl BigQueryClient {
     ) -> Result<(), BQError> {
         let project_id = &self.project_id;
         let query = format!(
-            "insert into `{project_id}.{dataset_id}.copied_tables` (table_id) values ({table_id})",
+            "insert into `{project_id}.{dataset_id}._copied_tables` (table_id) values ({table_id})",
         );
 
         let _ = self.query(query).await?;

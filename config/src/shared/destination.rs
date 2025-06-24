@@ -21,13 +21,9 @@ pub enum DestinationConfig {
         /// BigQuery dataset identifier.
         dataset_id: String,
         /// Service account key for authenticating with BigQuery.
-        service_account_key: String,
+        gcp_sa_key_path: String,
         /// Maximum staleness in minutes for BigQuery CDC reads.
-        ///
-        /// If not set, the default staleness behavior is used. See
-        /// <https://cloud.google.com/bigquery/docs/change-data-capture#create-max-staleness>.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        max_staleness_mins: Option<u16>,
+        max_staleness_mins: u16,
     },
     /// Clickhouse destination configuration.
     ClickHouse {
@@ -49,13 +45,13 @@ impl fmt::Debug for DestinationConfig {
             Self::BigQuery {
                 project_id,
                 dataset_id,
-                service_account_key: _,
+                gcp_sa_key_path: _,
                 max_staleness_mins,
             } => f
                 .debug_struct("BigQuery")
                 .field("project_id", project_id)
                 .field("dataset_id", dataset_id)
-                .field("service_account_key", &"REDACTED")
+                .field("gcp_sa_key_path", &"REDACTED")
                 .field("max_staleness_mins", max_staleness_mins)
                 .finish(),
             Self::ClickHouse {

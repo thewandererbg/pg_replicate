@@ -1,5 +1,5 @@
 [package]
-name = "replicator_clickhouse"
+name = "replicator"
 version = "0.1.0"
 edition = "2021"
 
