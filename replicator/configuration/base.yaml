@@ -1,7 +1,5 @@
-batch:
-  max_size: 1000
-  max_fill_secs: 10
-tls:
-  trusted_root_certs: ""
-  enabled: false
-project: "abcdefghijklmnopqrst"
+pipeline:
+  id: 1
+  publication_name: "replicator_publication"
+supabase:
+  project_ref: "abcdefghijklmnopqrst"

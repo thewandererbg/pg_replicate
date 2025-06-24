@@ -1,20 +1,22 @@
-use crate::schema::{TableId, TableName};
-use crate::tokio::options::PgDatabaseOptions;
+use crate::schema::{ColumnSchema, Oid, TableName};
+use crate::tokio::config::PgConnectionConfig;
 use tokio::runtime::Handle;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::types::Type;
+use tokio_postgres::{Client, GenericClient, NoTls, Transaction};
 
-pub struct PgDatabase {
-    pub options: PgDatabaseOptions,
-    pub client: Client,
+pub enum TableModification<'a> {
+    AddColumn { name: &'a str, data_type: &'a str },
+    DropColumn { name: &'a str },
+    AlterColumn { name: &'a str, alteration: &'a str },
 }
 
-impl PgDatabase {
-    pub async fn new(options: PgDatabaseOptions) -> Self {
-        let client = create_pg_database(&options).await;
+pub struct PgDatabase<G> {
+    pub config: PgConnectionConfig,
+    pub client: Option<G>,
+    destroy_on_drop: bool,
+}
 
-        Self { options, client }
-    }
-
+impl<G: GenericClient> PgDatabase<G> {
     /// Creates a new publication for the specified tables.
     pub async fn create_publication(
         &self,
@@ -31,7 +33,11 @@ impl PgDatabase {
             publication_name,
             table_names.join(", ")
         );
-        self.client.execute(&create_publication_query, &[]).await?;
+        self.client
+            .as_ref()
+            .unwrap()
+            .execute(&create_publication_query, &[])
+            .await?;
 
         Ok(())
     }
@@ -41,7 +47,7 @@ impl PgDatabase {
         &self,
         table_name: TableName,
         columns: &[(&str, &str)], // (column_name, column_type)
-    ) -> Result<TableId, tokio_postgres::Error> {
+    ) -> Result<Oid, tokio_postgres::Error> {
         let columns_str = columns
             .iter()
             .map(|(name, typ)| format!("{} {}", name, typ))
@@ -53,11 +59,17 @@ impl PgDatabase {
             table_name.as_quoted_identifier(),
             columns_str
         );
-        self.client.execute(&create_table_query, &[]).await?;
+        self.client
+            .as_ref()
+            .unwrap()
+            .execute(&create_table_query, &[])
+            .await?;
 
         // Get the OID of the newly created table
         let row = self
             .client
+            .as_ref()
+            .unwrap()
             .query_one(
                 "select c.oid from pg_class c join pg_namespace n on n.oid = c.relnamespace \
             where n.nspname = $1 and c.relname = $2",
@@ -65,9 +77,45 @@ impl PgDatabase {
             )
             .await?;
 
-        let table_id: TableId = row.get(0);
+        let table_id: Oid = row.get(0);
 
         Ok(table_id)
+    }
+
+    /// Modifies a table by adding, dropping, or altering columns.
+    pub async fn alter_table(
+        &self,
+        table_name: TableName,
+        modifications: &[TableModification<'_>],
+    ) -> Result<(), tokio_postgres::Error> {
+        let modifications_str = modifications
+            .iter()
+            .map(|modification| match modification {
+                TableModification::AddColumn { name, data_type } => {
+                    format!("add column {} {}", name, data_type)
+                }
+                TableModification::DropColumn { name } => {
+                    format!("drop column {}", name)
+                }
+                TableModification::AlterColumn { name, alteration } => {
+                    format!("alter column {} {}", name, alteration)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let alter_table_query = format!(
+            "alter table {} {}",
+            table_name.as_quoted_identifier(),
+            modifications_str
+        );
+        self.client
+            .as_ref()
+            .unwrap()
+            .execute(&alter_table_query, &[])
+            .await?;
+
+        Ok(())
     }
 
     /// Inserts values into the specified table.
@@ -88,7 +136,39 @@ impl PgDatabase {
             placeholders_str
         );
 
-        self.client.execute(&insert_query, values).await
+        self.client
+            .as_ref()
+            .unwrap()
+            .execute(&insert_query, values)
+            .await
+    }
+
+    /// Generates values using PostgreSQL's `generate_series` function
+    /// and inserts them into the specified table.
+    pub async fn insert_generate_series(
+        &self,
+        table_name: TableName,
+        columns: &[&str],
+        start: i64,
+        end: i64,
+        step: i64,
+    ) -> Result<u64, tokio_postgres::Error> {
+        let columns_str = columns.join(", ");
+        let values = (1..=columns.len())
+            .map(|_| format!("generate_series({}, {}, {})", start, end, step))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let insert_query = format!(
+            "insert into {} ({columns_str}) values ({values})",
+            table_name.as_quoted_identifier(),
+        );
+
+        self.client
+            .as_ref()
+            .unwrap()
+            .execute(&dbg!(insert_query), &[])
+            .await
     }
 
     /// Updates all rows in the specified table with the given values.
@@ -111,7 +191,11 @@ impl PgDatabase {
             set_clause
         );
 
-        self.client.execute(&update_query, &[]).await
+        self.client
+            .as_ref()
+            .unwrap()
+            .execute(&update_query, &[])
+            .await
     }
 
     /// Queries rows from a single column of a table.
@@ -132,18 +216,67 @@ impl PgDatabase {
             where_str
         );
 
-        let rows = self.client.query(&query, &[]).await?;
+        let rows = self.client.as_ref().unwrap().query(&query, &[]).await?;
         Ok(rows.iter().map(|row| row.get(0)).collect())
     }
 }
 
-impl Drop for PgDatabase {
+impl PgDatabase<Client> {
+    pub async fn new(config: PgConnectionConfig) -> Self {
+        let client = create_pg_database(&config).await;
+
+        Self {
+            config,
+            client: Some(client),
+            destroy_on_drop: true,
+        }
+    }
+
+    /// Begins a new transaction.
+    ///
+    /// Returns a `Transaction` object that can be used to execute queries within the transaction.
+    /// The transaction must be committed or rolled back before it is dropped.
+    pub async fn begin_transaction(&mut self) -> PgDatabase<Transaction<'_>> {
+        let transaction = self.client.as_mut().unwrap().transaction().await.unwrap();
+
+        PgDatabase {
+            config: self.config.clone(),
+            client: Some(transaction),
+            destroy_on_drop: false,
+        }
+    }
+}
+
+impl PgDatabase<Transaction<'_>> {
+    pub async fn commit_transaction(&mut self) {
+        if let Some(client) = self.client.take() {
+            client.commit().await.unwrap();
+        }
+    }
+}
+
+impl<G> Drop for PgDatabase<G> {
     fn drop(&mut self) {
-        // To use `block_in_place,` we need a multithreaded runtime since when a blocking
-        // task is issued, the runtime will offload existing tasks to another worker.
-        tokio::task::block_in_place(move || {
-            Handle::current().block_on(async move { drop_pg_database(&self.options).await });
-        });
+        if self.destroy_on_drop {
+            // To use `block_in_place,` we need a multithreaded runtime since when a blocking
+            // task is issued, the runtime will offload existing tasks to another worker.
+            tokio::task::block_in_place(move || {
+                Handle::current().block_on(async move { drop_pg_database(&self.config).await });
+            });
+        }
+    }
+}
+
+/// Returns a [`ColumnSchema`] representing a non-nullable, primary key column
+/// named "id" of type `INT8` which is added by default to all tables created within
+/// [`PgDatabase`].
+pub fn id_column_schema() -> ColumnSchema {
+    ColumnSchema {
+        name: "id".to_string(),
+        typ: Type::INT8,
+        modifier: -1,
+        nullable: false,
+        primary: true,
     }
 }
 
@@ -152,9 +285,9 @@ impl Drop for PgDatabase {
 /// Establishes a connection to the PostgreSQL server using the provided options,
 /// creates a new database, and returns a [`Client`] connected to the new database.
 /// Panics if the connection fails or if database creation fails.
-pub async fn create_pg_database(options: &PgDatabaseOptions) -> Client {
+pub async fn create_pg_database(config: &PgConnectionConfig) -> Client {
     // Create the database via a single connection
-    let (client, connection) = options
+    let (client, connection) = config
         .without_db()
         .connect(NoTls)
         .await
@@ -169,12 +302,12 @@ pub async fn create_pg_database(options: &PgDatabaseOptions) -> Client {
 
     // Create the database
     client
-        .execute(&*format!(r#"create database "{}";"#, options.name), &[])
+        .execute(&*format!(r#"create database "{}";"#, config.name), &[])
         .await
         .expect("Failed to create database");
 
     // Create a new client connected to the created database
-    let (client, connection) = options
+    let (client, connection) = config
         .with_db()
         .connect(NoTls)
         .await
@@ -194,11 +327,11 @@ pub async fn create_pg_database(options: &PgDatabaseOptions) -> Client {
 ///
 /// Connects to the PostgreSQL server, forcefully terminates all active connections
 /// to the target database, and drops the database if it exists. Useful for cleaning
-/// up test databases. Takes a reference to [`PgDatabaseOptions`] specifying the database
+/// up test databases. Takes a reference to [`PgConnectionConfig`] specifying the database
 /// to drop. Panics if any operation fails.
-pub async fn drop_pg_database(options: &PgDatabaseOptions) {
+pub async fn drop_pg_database(config: &PgConnectionConfig) {
     // Connect to the default database
-    let (client, connection) = options
+    let (client, connection) = config
         .without_db()
         .connect(NoTls)
         .await
@@ -220,23 +353,22 @@ pub async fn drop_pg_database(options: &PgDatabaseOptions) {
                 from pg_stat_activity
                 where pg_stat_activity.datname = '{}'
                 and pid <> pg_backend_pid();"#,
-                options.name
+                config.name
             ),
             &[],
         )
         .await
         .expect("Failed to terminate database connections");
 
-    // Drop any test replication slots
+    // Drop any replication slots on this database
     client
         .execute(
             &format!(
                 r#"
-                select pg_drop_replication_slot(slot_name) 
-                from pg_replication_slots 
-                where slot_name like 'test_%'
-                and database = '{}';"#,
-                options.name
+                select pg_drop_replication_slot(slot_name)
+                from pg_replication_slots
+                where database = '{}';"#,
+                config.name
             ),
             &[],
         )
@@ -246,7 +378,7 @@ pub async fn drop_pg_database(options: &PgDatabaseOptions) {
     // Drop the database
     client
         .execute(
-            &format!(r#"drop database if exists "{}";"#, options.name),
+            &format!(r#"drop database if exists "{}";"#, config.name),
             &[],
         )
         .await

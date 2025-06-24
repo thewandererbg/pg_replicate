@@ -1,12 +1,13 @@
 source:
-  postgres:
-    host: "localhost"
-    port: 5432
-    name: "postgres"
-    username: "postgres"
-    slot_name: "replicator_slot"
-    publication: "replicator_publication"
-sink:
-  big_query:
-    project_id: "project-id"
-    dataset_id: "dataset-id"
+  host: "localhost"
+  port: 5430
+  name: "postgres"
+  username: "postgres"
+  password: "postgres"
+  tls:
+    trusted_root_certs: ""
+    enabled: false
+state_store:
+  memory:
+destination:
+  memory:

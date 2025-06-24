@@ -26,3 +26,10 @@ Cargo.lock
 # Safe ignore
 prod.yaml
 key_bq.json
+# mkdocs build directory
+site/
+
+# venv files
+bin/
+lib/
+pyvenv.cfg
