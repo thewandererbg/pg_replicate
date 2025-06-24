@@ -4,12 +4,9 @@
 //! It supports both the [`sqlx`] and [`tokio-postgres`] crates through feature flags.
 
 pub mod schema;
-<<<<<<< HEAD
-=======
 #[cfg(feature = "sqlx")]
 pub mod sqlx;
 pub mod time;
->>>>>>> main
 #[cfg(feature = "tokio")]
 pub mod tokio;
 pub mod types;

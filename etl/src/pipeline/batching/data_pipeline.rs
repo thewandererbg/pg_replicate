@@ -190,10 +190,10 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                         events.push(event);
                     }
                     let last_lsn = self
-                        .sink
+                        .destination
                         .write_cdc_events(events)
                         .await
-                        .map_err(PipelineError::Sink)?;
+                        .map_err(PipelineError::Destination)?;
                     current_lsn = last_lsn;
                     if send_status_update {
                         info!("sending status update with lsn: {last_lsn}");
@@ -210,7 +210,6 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                             .map_err(CommonSourceError::StatusUpdate)?;
                     }
                 }
-<<<<<<< HEAD:pg_replicate/src/pipeline/batching/data_pipeline.rs
                 _ = ping_interval.tick() => {
                     info!("ping server with lsn: {current_lsn}");
                     let inner = unsafe {
@@ -222,32 +221,6 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                     let _ = inner.as_mut().send_status_update(current_lsn).await;
                 }
                 else => break
-=======
-                let event = event.map_err(CommonSourceError::CdcStream)?;
-                if let CdcEvent::KeepAliveRequested { reply } = event {
-                    send_status_update = reply;
-                };
-                events.push(event);
-            }
-            let last_lsn = self
-                .destination
-                .write_cdc_events(events)
-                .await
-                .map_err(PipelineError::Destination)?;
-            if send_status_update {
-                info!("sending status update with lsn: {last_lsn}");
-                let inner = unsafe {
-                    batch_timeout_stream
-                        .as_mut()
-                        .get_unchecked_mut()
-                        .get_inner_mut()
-                };
-                inner
-                    .as_mut()
-                    .send_status_update(last_lsn)
-                    .await
-                    .map_err(CommonSourceError::StatusUpdate)?;
->>>>>>> main:etl/src/pipeline/batching/data_pipeline.rs
             }
         }
 

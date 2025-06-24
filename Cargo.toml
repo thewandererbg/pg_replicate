@@ -1,25 +1,14 @@
 [workspace]
 resolver = "2"
-members = [
-    "pg_replicate",
-    "postgres",
-    "replicator",
-    "telemetry",
-    "replicator_clickhouse"
-]
+
+members = ["config", "etl", "postgres", "replicator_clickhouse", "telemetry"]
 
 [workspace.dependencies]
-pg_replicate = { path = "pg_replicate" }
-members = ["api", "config", "etl", "postgres", "replicator", "telemetry"]
-
-[workspace.dependencies]
-api = { path = "api" }
 config = { path = "config" }
 etl = { path = "etl" }
 postgres = { path = "postgres" }
-replicator = { path = "replicator" }
-telemetry = { path = "telemetry" }
 replicator_clickhouse = { path = "replicator_clickhouse" }
+telemetry = { path = "telemetry" }
 
 
 actix-web = { version = "4", default-features = false }

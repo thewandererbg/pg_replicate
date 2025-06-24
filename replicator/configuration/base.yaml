@@ -1,5 +1,0 @@
-pipeline:
-  id: 1
-  publication_name: "replicator_publication"
-supabase:
-  project_ref: "abcdefghijklmnopqrst"

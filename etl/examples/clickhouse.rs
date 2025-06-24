@@ -1,10 +1,10 @@
 use std::{error::Error, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
-use pg_replicate::{
+use etl::{
     pipeline::{
         batching::{data_pipeline::BatchDataPipeline, BatchConfig},
-        sinks::clickhouse::ClickHouseBatchSink,
+        destinations::clickhouse::ClickHouseBatchDestination,
         sources::postgres::{PostgresSource, TableNamesFrom},
         PipelineAction,
     },
@@ -12,7 +12,7 @@ use pg_replicate::{
 };
 
 use postgres::schema::TableName;
-use postgres::tokio::options::PgDatabaseOptions;
+use postgres::tokio::config::PgConnectionConfig;
 use tracing::error;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -126,7 +126,7 @@ async fn main_impl() -> Result<(), Box<dyn Error>> {
     let db_args = args.db_args;
     let ch_args = args.ch_args;
 
-    let options = PgDatabaseOptions {
+    let options = PgConnectionConfig {
         host: db_args.db_host,
         port: db_args.db_port,
         name: db_args.db_name,
@@ -160,8 +160,8 @@ async fn main_impl() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    // Initialize ClickHouse sink
-    let clickhouse_sink = ClickHouseBatchSink::new_with_credentials(
+    // Initialize ClickHouse destination
+    let clickhouse_destination = ClickHouseBatchDestination::new_with_credentials(
         ch_args.ch_url,
         ch_args.ch_database,
         ch_args.ch_username,
@@ -173,8 +173,12 @@ async fn main_impl() -> Result<(), Box<dyn Error>> {
         ch_args.max_batch_size,
         Duration::from_secs(ch_args.max_batch_fill_duration_secs),
     );
-    let mut pipeline =
-        BatchDataPipeline::new(postgres_source, clickhouse_sink, action, batch_config);
+    let mut pipeline = BatchDataPipeline::new(
+        postgres_source,
+        clickhouse_destination,
+        action,
+        batch_config,
+    );
 
     pipeline.start().await?;
 

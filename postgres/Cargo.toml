@@ -19,3 +19,4 @@ tokio-postgres = { workspace = true, features = [
 [features]
 test-utils = []
 tokio = []
+sqlx = []

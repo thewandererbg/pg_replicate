@@ -14,10 +14,10 @@ use crate::{
 };
 use postgres::schema::{ColumnSchema, TableId, TableName, TableSchema};
 
-use super::{BatchSink, SinkError};
+use super::{BatchDestination, DestinationError};
 
 #[derive(Debug, Error)]
-pub enum ClickHouseSinkError {
+pub enum ClickHouseDestinationError {
     #[error("clickhouse error: {0}")]
     ClickHouse(#[from] CHError),
 
@@ -34,27 +34,27 @@ pub enum ClickHouseSinkError {
     CommitWithoutBegin,
 }
 
-impl SinkError for ClickHouseSinkError {}
+impl DestinationError for ClickHouseDestinationError {}
 
-pub struct ClickHouseBatchSink {
+pub struct ClickHouseBatchDestination {
     client: ClickHouseClient,
     table_schemas: Option<HashMap<TableId, TableSchema>>,
     committed_lsn: Option<PgLsn>,
     final_lsn: Option<PgLsn>,
 }
 
-impl ClickHouseBatchSink {
+impl ClickHouseBatchDestination {
     pub async fn new_with_credentials(
         url: String,
         database: String,
         username: String,
         password: String,
-    ) -> Result<ClickHouseBatchSink, CHError> {
+    ) -> Result<ClickHouseBatchDestination, CHError> {
         let client =
             ClickHouseClient::new_with_credentials(&url, database.clone(), &username, &password)
                 .await?;
 
-        Ok(ClickHouseBatchSink {
+        Ok(ClickHouseBatchDestination {
             client,
             table_schemas: None,
             committed_lsn: None,
@@ -62,12 +62,15 @@ impl ClickHouseBatchSink {
         })
     }
 
-    fn get_table_schema(&self, table_id: TableId) -> Result<&TableSchema, ClickHouseSinkError> {
+    fn get_table_schema(
+        &self,
+        table_id: TableId,
+    ) -> Result<&TableSchema, ClickHouseDestinationError> {
         self.table_schemas
             .as_ref()
-            .ok_or(ClickHouseSinkError::MissingTableSchemas)?
+            .ok_or(ClickHouseDestinationError::MissingTableSchemas)?
             .get(&table_id)
-            .ok_or(ClickHouseSinkError::MissingTableId(table_id))
+            .ok_or(ClickHouseDestinationError::MissingTableId(table_id))
     }
 
     fn table_name_in_ch(table_name: &TableName) -> String {
@@ -80,8 +83,8 @@ impl ClickHouseBatchSink {
 }
 
 #[async_trait]
-impl BatchSink for ClickHouseBatchSink {
-    type Error = ClickHouseSinkError;
+impl BatchDestination for ClickHouseBatchDestination {
+    type Error = ClickHouseDestinationError;
 
     async fn get_resumption_state(&mut self) -> Result<PipelineResumptionState, Self::Error> {
         info!("getting resumption state from clickhouse");
@@ -137,7 +140,7 @@ impl BatchSink for ClickHouseBatchSink {
         table_schemas: HashMap<TableId, TableSchema>,
     ) -> Result<(), Self::Error> {
         for table_schema in table_schemas.values() {
-            let table_name = Self::table_name_in_ch(&table_schema.table_name);
+            let table_name = Self::table_name_in_ch(&table_schema.name);
             self.client
                 .create_or_update_table(
                     &table_name,
@@ -158,7 +161,7 @@ impl BatchSink for ClickHouseBatchSink {
         table_id: TableId,
     ) -> Result<(), Self::Error> {
         let table_schema = self.get_table_schema(table_id)?;
-        let table_name = Self::table_name_in_ch(&table_schema.table_name);
+        let table_name = Self::table_name_in_ch(&table_schema.name);
         let mut column_schemas = table_schema.column_schemas.clone();
 
         column_schemas.push(ColumnSchema {
@@ -210,12 +213,12 @@ impl BatchSink for ClickHouseBatchSink {
                         if commit_lsn == final_lsn {
                             new_last_lsn = commit_lsn;
                         } else {
-                            Err(ClickHouseSinkError::IncorrectCommitLsn(
+                            Err(ClickHouseDestinationError::IncorrectCommitLsn(
                                 commit_lsn, final_lsn,
                             ))?
                         }
                     } else {
-                        Err(ClickHouseSinkError::CommitWithoutBegin)?
+                        Err(ClickHouseDestinationError::CommitWithoutBegin)?
                     }
                 }
                 CdcEvent::Insert((table_id, mut table_row)) => {
@@ -243,7 +246,7 @@ impl BatchSink for ClickHouseBatchSink {
                 CdcEvent::Truncate(truncate_body) => {
                     for table_id in truncate_body.rel_ids() {
                         let table_schema = self.get_table_schema(*table_id)?;
-                        let table_name = Self::table_name_in_ch(&table_schema.table_name);
+                        let table_name = Self::table_name_in_ch(&table_schema.name);
                         self.client.truncate_table(&table_name).await?;
                     }
                 }
@@ -256,7 +259,7 @@ impl BatchSink for ClickHouseBatchSink {
                         .collect();
 
                     let table_name =
-                        Self::table_name_in_ch(&self.get_table_schema(r.rel_id())?.table_name);
+                        Self::table_name_in_ch(&self.get_table_schema(r.rel_id())?.name);
                     let existing_columns = self.client.get_table_columns(&table_name).await?;
 
                     let new_columns: Vec<_> = relation_column_names
@@ -282,7 +285,7 @@ impl BatchSink for ClickHouseBatchSink {
         // Process batched operations for each table
         for (table_id, table_rows) in table_name_to_table_rows {
             let table_schema = self.get_table_schema(table_id)?;
-            let table_name = Self::table_name_in_ch(&table_schema.table_name);
+            let table_name = Self::table_name_in_ch(&table_schema.name);
             let mut column_schemas = table_schema.column_schemas.clone();
 
             column_schemas.push(ColumnSchema {
@@ -323,7 +326,7 @@ impl BatchSink for ClickHouseBatchSink {
 
     async fn truncate_table(&mut self, table_id: TableId) -> Result<(), Self::Error> {
         if let Some(table_schema) = self.table_schemas.as_ref().and_then(|ts| ts.get(&table_id)) {
-            let table_name = Self::table_name_in_ch(&table_schema.table_name);
+            let table_name = Self::table_name_in_ch(&table_schema.name);
             self.client.truncate_table(&table_name).await?;
         }
         Ok(())
