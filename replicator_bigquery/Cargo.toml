@@ -1,0 +1,18 @@
+[package]
+name = "replicator_bigquery"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+config = { workspace = true }
+etl = { workspace = true, features = ["bigquery"] }
+postgres = { workspace = true, features = ["tokio"] }
+telemetry = { workspace = true }
+
+anyhow = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+rustls-pemfile = { workspace = true, features = ["std"] }
+secrecy = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tracing = { workspace = true, default-features = true }
+rustls = { workspace = true, features = ["aws-lc-rs", "logging"] }

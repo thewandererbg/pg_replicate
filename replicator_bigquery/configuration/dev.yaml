@@ -1,0 +1,18 @@
+source:
+  host: "172.17.0.1"
+  port: 5432
+  name: "postgres"
+  username: "postgres"
+  password: "password"
+  slot_name: "stdout_slot"
+  tls:
+    trusted_root_certs: ""
+    enabled: false
+destination:
+  big_query:
+    project_id: "vigo-riders"
+    dataset_id: "dmsin_test"
+    gcp_sa_key_path: "./key_bq.json"
+    max_staleness_mins: 1
+state_store:
+  memory:
