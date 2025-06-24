@@ -1,15 +1,13 @@
 [workspace]
 resolver = "2"
 
-members = ["config", "etl", "postgres", "replicator_clickhouse", "telemetry"]
+members = ["etl", "postgres", "replicator_clickhouse", "telemetry"]
 
 [workspace.dependencies]
-config = { path = "config" }
 etl = { path = "etl" }
 postgres = { path = "postgres" }
 replicator_clickhouse = { path = "replicator_clickhouse" }
 telemetry = { path = "telemetry" }
-
 
 actix-web = { version = "4", default-features = false }
 actix-web-httpauth = { version = "0.8.2", default-features = false }
@@ -61,3 +59,4 @@ uuid = { version = "1.10.0", default-features = false }
 # gcp-bigquery-client = { path = "../gcp-bigquery-client" }
 
 clickhouse = { version = "0.13.2", default-features = false }
+config = { version = "0.14", default-features = false }
