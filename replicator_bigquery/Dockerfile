@@ -3,11 +3,11 @@ WORKDIR /app
 # Install build dependencies
 RUN apk add --no-cache clang musl-dev
 COPY . .
-RUN cargo build --release -p replicator_clickhouse
+RUN cargo build --release -p replicator_bigquery
 
 FROM alpine:latest
 WORKDIR /app
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates
-COPY --from=builder /app/target/release/replicator_clickhouse replicator
+COPY --from=builder /app/target/release/replicator_bigquery replicator
 ENTRYPOINT ["./replicator"]
