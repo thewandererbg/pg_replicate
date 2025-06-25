@@ -103,32 +103,32 @@ impl BigQueryClient {
         }
     }
 
-    fn is_array_type(typ: &Type) -> bool {
-        matches!(
-            typ,
-            &Type::BOOL_ARRAY
-                | &Type::CHAR_ARRAY
-                | &Type::BPCHAR_ARRAY
-                | &Type::VARCHAR_ARRAY
-                | &Type::NAME_ARRAY
-                | &Type::TEXT_ARRAY
-                | &Type::INT2_ARRAY
-                | &Type::INT4_ARRAY
-                | &Type::INT8_ARRAY
-                | &Type::FLOAT4_ARRAY
-                | &Type::FLOAT8_ARRAY
-                | &Type::NUMERIC_ARRAY
-                | &Type::DATE_ARRAY
-                | &Type::TIME_ARRAY
-                | &Type::TIMESTAMP_ARRAY
-                | &Type::TIMESTAMPTZ_ARRAY
-                | &Type::UUID_ARRAY
-                | &Type::JSON_ARRAY
-                | &Type::JSONB_ARRAY
-                | &Type::OID_ARRAY
-                | &Type::BYTEA_ARRAY
-        )
-    }
+    // fn is_array_type(typ: &Type) -> bool {
+    //     matches!(
+    //         typ,
+    //         &Type::BOOL_ARRAY
+    //             | &Type::CHAR_ARRAY
+    //             | &Type::BPCHAR_ARRAY
+    //             | &Type::VARCHAR_ARRAY
+    //             | &Type::NAME_ARRAY
+    //             | &Type::TEXT_ARRAY
+    //             | &Type::INT2_ARRAY
+    //             | &Type::INT4_ARRAY
+    //             | &Type::INT8_ARRAY
+    //             | &Type::FLOAT4_ARRAY
+    //             | &Type::FLOAT8_ARRAY
+    //             | &Type::NUMERIC_ARRAY
+    //             | &Type::DATE_ARRAY
+    //             | &Type::TIME_ARRAY
+    //             | &Type::TIMESTAMP_ARRAY
+    //             | &Type::TIMESTAMPTZ_ARRAY
+    //             | &Type::UUID_ARRAY
+    //             | &Type::JSON_ARRAY
+    //             | &Type::JSONB_ARRAY
+    //             | &Type::OID_ARRAY
+    //             | &Type::BYTEA_ARRAY
+    //     )
+    // }
 
     fn column_spec(column_schema: &ColumnSchema, s: &mut String) {
         s.push('`');
@@ -137,7 +137,10 @@ impl BigQueryClient {
         s.push(' ');
         let typ = Self::postgres_to_bigquery_type(&column_schema.typ);
         s.push_str(typ);
-        if !column_schema.nullable && !Self::is_array_type(&column_schema.typ) {
+        // if !column_schema.nullable && !Self::is_array_type(&column_schema.typ) {
+        //     s.push_str(" not null");
+        // };
+        if !column_schema.nullable {
             s.push_str(" not null");
         };
     }
@@ -185,7 +188,7 @@ impl BigQueryClient {
 
     fn partition_option(column_schemas: &[ColumnSchema]) -> String {
         if column_schemas.iter().any(|col| col.name == "created_at") {
-            "PARTITION BY DATE(created_at)".to_string()
+            "partition by date(created_at)".to_string()
         } else {
             "".to_string()
         }
@@ -1073,13 +1076,7 @@ pub fn table_schema_to_descriptor(table_schema: &TableSchema) -> TableDescriptor
             | Type::JSONB_ARRAY
             | Type::OID_ARRAY
             | Type::BYTEA_ARRAY => ColumnMode::Repeated,
-            _ => {
-                if column_schema.nullable {
-                    ColumnMode::Nullable
-                } else {
-                    ColumnMode::Required
-                }
-            }
+            _ => ColumnMode::Nullable,
         };
 
         field_descriptors.push(FieldDescriptor {
@@ -1094,6 +1091,13 @@ pub fn table_schema_to_descriptor(table_schema: &TableSchema) -> TableDescriptor
     field_descriptors.push(FieldDescriptor {
         number,
         name: "_CHANGE_TYPE".to_string(),
+        typ: ColumnType::String,
+        mode: ColumnMode::Required,
+    });
+
+    field_descriptors.push(FieldDescriptor {
+        number: number + 1,
+        name: "_CHANGE_SEQUENCE_NUMBER".to_string(),
         typ: ColumnType::String,
         mode: ColumnMode::Required,
     });

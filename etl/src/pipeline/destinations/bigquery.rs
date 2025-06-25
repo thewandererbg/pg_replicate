@@ -194,6 +194,7 @@ impl BatchDestination for BigQueryBatchDestination {
 
         for table_row in &mut table_rows {
             table_row.values.push(Cell::String("UPSERT".to_string()));
+            table_row.values.push(Cell::String("0/1".to_string()));
         }
 
         self.client
@@ -207,6 +208,7 @@ impl BatchDestination for BigQueryBatchDestination {
         let mut table_name_to_table_rows = HashMap::new();
         let mut new_last_lsn = PgLsn::from(0);
         for event in events {
+            // info!("{event:?}");
             match event {
                 CdcEvent::Begin(begin_body) => {
                     let final_lsn_u64 = begin_body.final_lsn();
@@ -228,18 +230,27 @@ impl BatchDestination for BigQueryBatchDestination {
                 }
                 CdcEvent::Insert((table_id, mut table_row)) => {
                     table_row.values.push(Cell::String("UPSERT".to_string()));
+                    table_row
+                        .values
+                        .push(Cell::String(self.final_lsn.unwrap().to_string()));
                     let table_rows: &mut Vec<TableRow> =
                         table_name_to_table_rows.entry(table_id).or_default();
                     table_rows.push(table_row);
                 }
                 CdcEvent::Update((table_id, mut table_row)) => {
                     table_row.values.push(Cell::String("UPSERT".to_string()));
+                    table_row
+                        .values
+                        .push(Cell::String(self.final_lsn.unwrap().to_string()));
                     let table_rows: &mut Vec<TableRow> =
                         table_name_to_table_rows.entry(table_id).or_default();
                     table_rows.push(table_row);
                 }
                 CdcEvent::Delete((table_id, mut table_row)) => {
                     table_row.values.push(Cell::String("DELETE".to_string()));
+                    table_row
+                        .values
+                        .push(Cell::String(self.final_lsn.unwrap().to_string()));
                     let table_rows: &mut Vec<TableRow> =
                         table_name_to_table_rows.entry(table_id).or_default();
                     table_rows.push(table_row);
@@ -258,7 +269,6 @@ impl BatchDestination for BigQueryBatchDestination {
                 CdcEvent::Type(_) => {}
             }
         }
-
         for (table_id, table_rows) in table_name_to_table_rows {
             let table_schema = self.get_table_schema(table_id)?;
             let table_name = Self::table_name_in_bq(&table_schema.name);
