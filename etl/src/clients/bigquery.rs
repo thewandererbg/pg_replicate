@@ -69,6 +69,38 @@ impl BigQueryClient {
         }
     }
 
+    pub async fn create_or_update_table(
+        &self,
+        dataset_id: &str,
+        table_name: &str,
+        column_schemas: &[ColumnSchema],
+        max_staleness_mins: u16,
+    ) -> Result<bool, BQError> {
+        if self.table_exists(dataset_id, table_name).await? {
+            // If table exists, check for new columns
+            let existing_columns = self.get_table_columns(dataset_id, table_name).await?;
+
+            // Find columns that exist in the new schema but not in the table
+            let new_columns: Vec<&ColumnSchema> = column_schemas
+                .iter()
+                .filter(|col| !existing_columns.contains(&col.name))
+                .collect();
+
+            // If there are new columns, add them to the table
+            if !new_columns.is_empty() {
+                for column in &new_columns {
+                    self.add_column_to_table(dataset_id, table_name, column)
+                        .await?;
+                }
+            }
+            Ok(false)
+        } else {
+            self.create_table(dataset_id, table_name, column_schemas, max_staleness_mins)
+                .await?;
+            Ok(true)
+        }
+    }
+
     fn postgres_to_bigquery_type(typ: &Type) -> &'static str {
         match typ {
             &Type::BOOL => "bool",
@@ -589,6 +621,49 @@ impl BigQueryClient {
             .query(&self.project_id, QueryRequest::new(query))
             .await?;
         Ok(ResultSet::new_from_query_response(query_response))
+    }
+
+    // Add a new column to an existing table
+    pub async fn add_column_to_table(
+        &self,
+        dataset_id: &str,
+        table_name: &str,
+        column: &ColumnSchema,
+    ) -> Result<(), BQError> {
+        let column_type = Self::postgres_to_bigquery_type(&column.typ);
+        let nullable = if column.nullable { "" } else { " NOT NULL" };
+
+        let query = format!(
+            "ALTER TABLE `{}.{}.{}` ADD COLUMN {} {}{}",
+            self.project_id, dataset_id, table_name, column.name, column_type, nullable
+        );
+
+        self.query(query).await?;
+        Ok(())
+    }
+
+    pub async fn get_table_columns(
+        &self,
+        dataset_id: &str,
+        table_name: &str,
+    ) -> Result<HashSet<String>, BQError> {
+        let query = format!(
+            "SELECT column_name
+             FROM `{}.{}.INFORMATION_SCHEMA.COLUMNS`
+             WHERE table_name = '{}'",
+            self.project_id, dataset_id, table_name
+        );
+
+        let mut rs = self.query(query).await?;
+
+        let mut columns = HashSet::new();
+        while rs.next_row() {
+            if let Some(column_name) = rs.get_string_by_name("column_name")? {
+                columns.insert(column_name);
+            }
+        }
+
+        Ok(columns)
     }
 }
 

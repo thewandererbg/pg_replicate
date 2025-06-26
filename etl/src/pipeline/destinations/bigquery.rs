@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use gcp_bigquery_client::error::BQError;
@@ -169,7 +169,7 @@ impl BatchDestination for BigQueryBatchDestination {
         for table_schema in table_schemas.values() {
             let table_name = Self::table_name_in_bq(&table_schema.name);
             self.client
-                .create_table_if_missing(
+                .create_or_update_table(
                     &self.dataset_id,
                     &table_name,
                     &table_schema.column_schemas,
@@ -261,7 +261,33 @@ impl BatchDestination for BigQueryBatchDestination {
                     // If you try to truncate a table that has a streaming buffer, you will get the following error:
                     // TRUNCATE DML statement over table <tablename> would affect rows in the streaming buffer, which is not supported
                 }
-                CdcEvent::Relation(_) => {}
+                CdcEvent::Relation(r) => {
+                    let relation_column_names: HashSet<_> = r
+                        .columns()
+                        .iter()
+                        .filter_map(|col| col.name().ok())
+                        .map(String::from)
+                        .collect();
+
+                    let table_name =
+                        Self::table_name_in_bq(&self.get_table_schema(r.rel_id())?.name);
+                    let existing_columns = self
+                        .client
+                        .get_table_columns(&self.dataset_id, &table_name)
+                        .await?;
+
+                    let new_columns: Vec<_> = relation_column_names
+                        .difference(&existing_columns)
+                        .collect();
+
+                    if !new_columns.is_empty() {
+                        info!(
+                            "Detected new columns in {}: {:?}, restarting the replication",
+                            table_name, new_columns
+                        );
+                        std::process::exit(0);
+                    }
+                }
                 CdcEvent::KeepAliveRequested(keep_alive) => {
                     new_last_lsn = keep_alive.wal_end().into();
                     self.final_lsn = Some(new_last_lsn);
