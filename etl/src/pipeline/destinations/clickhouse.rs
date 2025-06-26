@@ -245,9 +245,8 @@ impl BatchDestination for ClickHouseBatchDestination {
                 CdcEvent::Origin(_) => {}
                 CdcEvent::Truncate(truncate_body) => {
                     for table_id in truncate_body.rel_ids() {
-                        let table_schema = self.get_table_schema(*table_id)?;
-                        let table_name = Self::table_name_in_ch(&table_schema.name);
-                        self.client.truncate_table(&table_name).await?;
+                        table_name_to_table_rows.remove(table_id);
+                        self.truncate_table(*table_id).await?;
                     }
                 }
                 CdcEvent::Relation(r) => {
