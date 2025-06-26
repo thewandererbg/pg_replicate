@@ -256,10 +256,14 @@ impl BatchDestination for BigQueryBatchDestination {
                     table_rows.push(table_row);
                 }
                 CdcEvent::Origin(_) => {}
-                CdcEvent::Truncate(_) => {
-                    // BigQuery doesn't support TRUNCATE DML statement when using the storage write API.
-                    // If you try to truncate a table that has a streaming buffer, you will get the following error:
-                    // TRUNCATE DML statement over table <tablename> would affect rows in the streaming buffer, which is not supported
+                CdcEvent::Truncate(truncate_body) => {
+                    for table_id in truncate_body.rel_ids() {
+                        let table_schema = self.get_table_schema(*table_id)?;
+                        let table_name = Self::table_name_in_bq(&table_schema.name);
+                        self.client
+                            .truncate_table(&self.dataset_id, &table_name)
+                            .await?;
+                    }
                 }
                 CdcEvent::Relation(r) => {
                     let relation_column_names: HashSet<_> = r
@@ -322,7 +326,13 @@ impl BatchDestination for BigQueryBatchDestination {
         Ok(())
     }
 
-    async fn truncate_table(&mut self, _table_id: TableId) -> Result<(), Self::Error> {
+    async fn truncate_table(&mut self, table_id: TableId) -> Result<(), Self::Error> {
+        if let Some(table_schema) = self.table_schemas.as_ref().and_then(|ts| ts.get(&table_id)) {
+            let table_name = Self::table_name_in_bq(&table_schema.name);
+            self.client
+                .truncate_table(&self.dataset_id, &table_name)
+                .await?;
+        }
         Ok(())
     }
 }

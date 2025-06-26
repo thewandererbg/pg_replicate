@@ -592,6 +592,16 @@ impl BigQueryClient {
         Ok(())
     }
 
+    pub async fn truncate_table(&self, dataset_id: &str, table_name: &str) -> Result<(), BQError> {
+        let project_id = &self.project_id;
+        info!("truncating table {project_id}.{dataset_id}.{table_name} in BigQuery");
+        let query = format!("truncate table `{project_id}.{dataset_id}.{table_name}`");
+
+        let _ = self.query(query).await?;
+
+        Ok(())
+    }
+
     pub async fn begin_transaction(&self) -> Result<(), BQError> {
         let _ = self.query("begin transaction".to_string()).await?;
 
