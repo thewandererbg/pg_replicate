@@ -200,6 +200,11 @@ impl ApplyLoopState {
 
         *last_commit_end_lsn = new_last_commit_end_lsn;
     }
+
+    /// Returns true if the apply loop is in the middle of processing a trasaction, false otherwise.
+    fn handling_transaction(&self) -> bool {
+        self.remote_final_lsn.is_some()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -321,6 +326,25 @@ where
                         false
                     )
                     .await?;
+
+                // If the apply loop is not in the middle of processing a transaction, call the hook's
+                // process_syncing_tables method so that apply worker:
+                //
+                // * Marks any table sync workers in sync wait state as catchup
+                // * Marks any sync done table sync workers as ready
+                //
+                // and the table sync worker:
+                //
+                // * Marks itself as sync done if it completes its catch phase
+                //
+                // This is done here as well in addition to at a commit boundary because we do not want
+                // the table sync workers to get stuck if there are no changes in the cdc stream.
+                if !state.handling_transaction() {
+                    let continue_loop = hook.process_syncing_tables(state.next_status_update.flush_lsn).await?;
+                    if !continue_loop {
+                        break Ok(ApplyLoopResult::ApplyStopped);
+                    }
+                }
             }
         }
     }

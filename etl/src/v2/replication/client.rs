@@ -204,12 +204,21 @@ pub struct PgReplicationClient {
 pub type PgReplicationResult<T> = Result<T, PgReplicationError>;
 
 impl PgReplicationClient {
+    /// Establishes a connection to PostgreSQL. The connection uses TLS if configured in the
+    /// passed [`PgConnectionConfig`].
+    ///
+    /// The connection is configured for logical replication mode
+    pub async fn connect(pg_connection_config: PgConnectionConfig) -> PgReplicationResult<Self> {
+        match pg_connection_config.tls.enabled {
+            true => PgReplicationClient::connect_tls(pg_connection_config).await,
+            false => PgReplicationClient::connect_no_tls(pg_connection_config).await,
+        }
+    }
+
     /// Establishes a connection to PostgreSQL without TLS encryption.
     ///
     /// The connection is configured for logical replication mode.
-    pub async fn connect_no_tls(
-        pg_connection_config: PgConnectionConfig,
-    ) -> PgReplicationResult<Self> {
+    async fn connect_no_tls(pg_connection_config: PgConnectionConfig) -> PgReplicationResult<Self> {
         let mut config: Config = pg_connection_config.clone().with_db();
         config.replication_mode(ReplicationMode::Logical);
 
@@ -230,11 +239,8 @@ impl PgReplicationClient {
 
     /// Establishes a TLS-encrypted connection to PostgreSQL.
     ///
-    /// The connection is configured for logical replication mode and uses the provided
-    /// trusted root certificates for TLS verification.
-    pub async fn connect_tls(
-        pg_connection_config: PgConnectionConfig,
-    ) -> PgReplicationResult<Self> {
+    /// The connection is configured for logical replication mode
+    async fn connect_tls(pg_connection_config: PgConnectionConfig) -> PgReplicationResult<Self> {
         let mut config: Config = pg_connection_config.clone().with_db();
         config.replication_mode(ReplicationMode::Logical);
 
