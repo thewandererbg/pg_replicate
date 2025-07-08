@@ -9,7 +9,6 @@ use crate::v2::replication::client::{PgReplicationClient, PgReplicationError};
 use crate::v2::replication::slot::{SlotError, get_slot_name};
 use crate::v2::replication::stream::{EventsStream, EventsStreamError};
 use crate::v2::schema::cache::SchemaCache;
-use crate::v2::state::store::base::StateStoreError;
 use crate::v2::workers::apply::ApplyWorkerHookError;
 use crate::v2::workers::base::WorkerType;
 use crate::v2::workers::table_sync::TableSyncWorkerHookError;
@@ -50,9 +49,6 @@ pub enum ApplyLoopError {
     #[error("Could not generate slot name in the apply loop: {0}")]
     Slot(#[from] SlotError),
 
-    #[error("An error happened in the state store while in the apply loop: {0}")]
-    StateStore(#[from] StateStoreError),
-
     #[error("An error occurred while building an event from a message in the apply loop: {0}")]
     EventConversion(#[from] EventConversionError),
 
@@ -90,7 +86,6 @@ impl From<TableSyncWorkerHookError> for ApplyLoopError {
 #[derive(Debug, Copy, Clone)]
 pub enum ApplyLoopResult {
     ApplyStopped,
-    ApplyCompleted,
 }
 
 pub trait ApplyLoopHook {

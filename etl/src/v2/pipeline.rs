@@ -11,21 +11,13 @@ use crate::v2::schema::cache::SchemaCache;
 use crate::v2::state::store::base::{StateStore, StateStoreError};
 use crate::v2::state::table::TableReplicationPhase;
 use crate::v2::workers::apply::{ApplyWorker, ApplyWorkerError, ApplyWorkerHandle};
-use crate::v2::workers::base::{Worker, WorkerHandle, WorkerWaitError, WorkerWaitErrors};
+use crate::v2::workers::base::{Worker, WorkerHandle, WorkerWaitErrors};
 use crate::v2::workers::pool::TableSyncWorkerPool;
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
-    #[error(
-        "Both the apply worker and table sync workers failed. Apply worker error: {0}, Table sync workers errors: {1}"
-    )]
-    BothWorkerTypesFailed(WorkerWaitError, WorkerWaitErrors),
-
-    #[error("The apply worker failed: {0}")]
-    ApplyWorkerFailed(#[from] WorkerWaitError),
-
-    #[error("Table sync workers failed: {0}")]
-    TableSyncWorkersFailed(WorkerWaitErrors),
+    #[error("One or more workers failed: {0}")]
+    OneOrMoreWorkersFailed(WorkerWaitErrors),
 
     #[error("PostgreSQL replication operation failed: {0}")]
     PgReplicationClient(#[from] PgReplicationError),
@@ -210,12 +202,16 @@ where
 
         info!("Waiting for apply worker to complete");
 
+        let mut errors = vec![];
+
         // We first wait for the apply worker to finish, since that must be done before waiting for
         // the table sync workers to finish, otherwise if we wait for sync workers first, we might
         // be having the apply worker that spawns new sync workers after we waited for the current
         // ones to finish.
         let apply_worker_result = apply_worker.wait().await;
-        if apply_worker_result.is_err() {
+        if let Err(err) = apply_worker_result {
+            errors.push(err);
+
             // TODO: in the future we might build a system based on the `ReactiveFuture` that
             //  automatically sends a shutdown signal to table sync workers on apply worker failure.
             // If there was an error in the apply worker, we want to shut down all table sync
@@ -234,19 +230,23 @@ where
 
         info!("Waiting for table sync workers to complete");
 
+        // We wait for all table sync workers to finish.
         let table_sync_workers_result = pool.wait_all().await;
-        if table_sync_workers_result.is_err() {
+        if let Err(err) = table_sync_workers_result {
+            errors.extend(err.0);
+
             info!("One or more table sync workers failed with an error");
         } else {
             info!("All table sync workers completed successfully");
         }
 
-        match (apply_worker_result, table_sync_workers_result) {
-            (Ok(_), Ok(_)) => Ok(()),
-            (Err(err), Ok(_)) => Err(PipelineError::ApplyWorkerFailed(err)),
-            (Ok(_), Err(err)) => Err(PipelineError::TableSyncWorkersFailed(err)),
-            (Err(err), Err(errs)) => Err(PipelineError::BothWorkerTypesFailed(err, errs)),
+        if !errors.is_empty() {
+            return Err(PipelineError::OneOrMoreWorkersFailed(WorkerWaitErrors(
+                errors,
+            )));
         }
+
+        Ok(())
     }
 
     #[allow(clippy::result_large_err)]

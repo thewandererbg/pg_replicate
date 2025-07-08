@@ -1,8 +1,9 @@
 use etl::v2::conversions::event::EventType;
 use etl::v2::destination::memory::MemoryDestination;
 use etl::v2::pipeline::{PipelineError, PipelineId};
+use etl::v2::replication::slot::get_slot_name;
 use etl::v2::state::table::TableReplicationPhaseType;
-use etl::v2::workers::base::WorkerWaitError;
+use etl::v2::workers::base::{WorkerType, WorkerWaitError};
 use postgres::schema::ColumnSchema;
 use postgres::tokio::test_utils::TableModification;
 use rand::random;
@@ -69,7 +70,7 @@ async fn test_pipeline_with_table_sync_worker_panic() {
 
     // We stop and inspect errors.
     match pipeline.shutdown_and_wait().await.err().unwrap() {
-        PipelineError::TableSyncWorkersFailed(err) => {
+        PipelineError::OneOrMoreWorkersFailed(err) => {
             assert!(matches!(
                 err.0.as_slice(),
                 [
@@ -129,7 +130,7 @@ async fn test_pipeline_with_table_sync_worker_error() {
 
     // We stop and inspect errors.
     match pipeline.shutdown_and_wait().await.err().unwrap() {
-        PipelineError::TableSyncWorkersFailed(err) => {
+        PipelineError::OneOrMoreWorkersFailed(err) => {
             assert!(matches!(
                 err.0.as_slice(),
                 [
@@ -513,13 +514,13 @@ async fn test_table_copy() {
     let users_state_notify = state_store
         .notify_on_replication_phase(
             database_schema.users_schema().id,
-            TableReplicationPhaseType::FinishedCopy,
+            TableReplicationPhaseType::SyncDone,
         )
         .await;
     let orders_state_notify = state_store
         .notify_on_replication_phase(
             database_schema.orders_schema().id,
-            TableReplicationPhaseType::FinishedCopy,
+            TableReplicationPhaseType::SyncDone,
         )
         .await;
 
@@ -542,6 +543,34 @@ async fn test_table_copy() {
     let age_sum =
         get_users_age_sum_from_rows(&destination, database_schema.users_schema().id).await;
     assert_eq!(age_sum, expected_age_sum);
+
+    // Check that the replication slots for the two tables have been removed.
+    let users_replication_slot = get_slot_name(
+        pipeline_id,
+        WorkerType::TableSync {
+            table_id: database_schema.users_schema().id,
+        },
+    )
+    .unwrap();
+    let orders_replication_slot = get_slot_name(
+        pipeline_id,
+        WorkerType::TableSync {
+            table_id: database_schema.orders_schema().id,
+        },
+    )
+    .unwrap();
+    assert!(
+        !database
+            .replication_slot_exists(&users_replication_slot)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !database
+            .replication_slot_exists(&orders_replication_slot)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -688,6 +717,34 @@ async fn test_table_copy_and_sync() {
     );
     assert_eq!(*users_inserts, expected_users_inserts);
     assert_eq!(*orders_inserts, expected_orders_inserts);
+
+    // Check that the replication slots for the two tables have been removed.
+    let users_replication_slot = get_slot_name(
+        pipeline_id,
+        WorkerType::TableSync {
+            table_id: database_schema.users_schema().id,
+        },
+    )
+    .unwrap();
+    let orders_replication_slot = get_slot_name(
+        pipeline_id,
+        WorkerType::TableSync {
+            table_id: database_schema.orders_schema().id,
+        },
+    )
+    .unwrap();
+    assert!(
+        !database
+            .replication_slot_exists(&users_replication_slot)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !database
+            .replication_slot_exists(&orders_replication_slot)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

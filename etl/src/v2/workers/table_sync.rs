@@ -14,6 +14,7 @@ use crate::v2::destination::base::Destination;
 use crate::v2::pipeline::PipelineId;
 use crate::v2::replication::apply::{ApplyLoopError, ApplyLoopHook, start_apply_loop};
 use crate::v2::replication::client::{PgReplicationClient, PgReplicationError};
+use crate::v2::replication::slot::get_slot_name;
 use crate::v2::replication::table_sync::{TableSyncError, TableSyncResult, start_table_sync};
 use crate::v2::schema::cache::SchemaCache;
 use crate::v2::state::store::base::{StateStore, StateStoreError};
@@ -21,7 +22,16 @@ use crate::v2::state::table::{TableReplicationPhase, TableReplicationPhaseType};
 use crate::v2::workers::base::{Worker, WorkerHandle, WorkerType, WorkerWaitError};
 use crate::v2::workers::pool::TableSyncWorkerPool;
 
+/// Maximum time to wait for a phase change before trying again.
 const PHASE_CHANGE_REFRESH_FREQUENCY: Duration = Duration::from_millis(100);
+
+/// Maximum time to wait for the slot deletion call to complete.
+///
+/// The reason for setting a timer on deletion is that we wait for the slot to become unused before
+/// deleting it. We want to avoid an infinite wait in case the slot fails to be released,
+/// as this could result in a connection being held indefinitely, potentially stalling the processing
+/// of new tables.
+const MAX_DELETE_SLOT_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum TableSyncWorkerError {
@@ -48,6 +58,9 @@ pub enum TableSyncWorkerError {
 pub enum TableSyncWorkerHookError {
     #[error("An error occurred while updating the table sync worker state: {0}")]
     TableSyncWorkerState(#[from] TableSyncWorkerStateError),
+
+    #[error("A Postgres replication error occurred in the table sync worker: {0}")]
+    PgReplication(#[from] PgReplicationError),
 }
 
 #[derive(Debug, Error)]
@@ -308,11 +321,12 @@ where
             // of table sync workers running in parallel which in turn helps limit the max
             // number of cocurrent connections to the source database.
             let permit = tokio::select! {
-                // Shutdown signal received, exit loop.
                 _ = self.shutdown_rx.changed() => {
                     info!("Shutting down table sync worker while waiting for a run permit");
+
                     return Ok(());
                 }
+
                 permit = self.run_permit.acquire() => {
                     permit
                 }
@@ -323,6 +337,10 @@ where
                 self.table_id
             );
 
+            // We create a new replication connection specifically for this table sync worker.
+            //
+            // Note that this connection must be tied to the lifetime of this worker, otherwise
+            // there will be problems when cleaning up the replication slot.
             let replication_client =
                 PgReplicationClient::connect(self.config.pg_connection.clone()).await?;
 
@@ -350,8 +368,8 @@ where
             start_apply_loop(
                 self.pipeline_id,
                 start_lsn,
-                self.config,
-                replication_client,
+                self.config.clone(),
+                replication_client.clone(),
                 self.schema_cache,
                 self.destination,
                 TableSyncWorkerHook::new(self.table_id, state_clone, self.state_store),
@@ -359,9 +377,40 @@ where
             )
             .await?;
 
+            // We delete the replication slot used by this table sync worker.
+            //
+            // Note that if the deletion fails, the slot will remain in the database and will not be
+            // removed later, so manual intervention will be required. The reason for not implementing
+            // an automatic cleanup mechanism is that it would introduce performance overhead,
+            // and we expect this call to fail only rarely.
+            let worker_type = WorkerType::TableSync {
+                table_id: self.table_id,
+            };
+            let slot_name = get_slot_name(self.pipeline_id, worker_type).unwrap();
+            let result = tokio::time::timeout(
+                MAX_DELETE_SLOT_WAIT,
+                replication_client.delete_slot(&slot_name),
+            )
+            .await;
+            match result {
+                Ok(Err(err)) => {
+                    error!(
+                        "Failed to delete the replication slot {slot_name} of the table sync worker {}: {err}",
+                        self.table_id
+                    )
+                }
+                Err(_) => {
+                    error!(
+                        "Failed to delete the replication slot {slot_name} of the table sync worker {} due to timeout",
+                        self.table_id
+                    );
+                }
+                _ => {}
+            }
+
             // This explicit drop is not strictly necessary but is added to make it extra clear
             // that the scope of the run permit is needed upto here to avoid multiple parallel
-            // connections
+            // connections.
             drop(permit);
 
             Ok(())
@@ -428,6 +477,14 @@ where
 
         // If we caught up with the lsn, we mark this table as `SyncDone` and stop the worker.
         if let TableReplicationPhase::Catchup { lsn } = inner.replication_phase() {
+            // TODO: there is currently a correctness bug in which we mark this table as sync done
+            //  before we actually acknowledged writes to dis  (since they are acknowledged after the
+            //  batch is processed). This is fine for apply workers since progress is tracked after
+            //  the batch is written, but for table sync workers this causes the problem where we might
+            //  crash after marking ourselves as `SynCdONE` and we end up not actually sending that data
+            //  and the apply worker still assumes that data is there so it will be lost forever.
+            //  Postgres doesn't have this problem since they process and acknowledge each commit message
+            //  individually.
             if current_lsn >= lsn {
                 inner
                     .set_phase_with(
@@ -435,11 +492,6 @@ where
                         self.state_store.clone(),
                     )
                     .await?;
-
-                // We drop the lock since we don't need to hold it while cleaning resources.
-                drop(inner);
-
-                // TODO: implement cleanup of slot.
 
                 info!(
                     "Table sync worker for table {} has caught up with the apply worker, shutting down",
