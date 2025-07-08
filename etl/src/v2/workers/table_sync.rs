@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio::sync::{AcquireError, Notify, RwLock, RwLockReadGuard, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_postgres::types::PgLsn;
-use tracing::{info, warn};
+use tracing::{Instrument, debug, error, info};
 
 use crate::v2::concurrency::future::ReactiveFuture;
 use crate::v2::concurrency::shutdown::{ShutdownResult, ShutdownRx};
@@ -66,8 +66,8 @@ pub struct TableSyncWorkerStateInner {
 impl TableSyncWorkerStateInner {
     pub fn set_phase(&mut self, phase: TableReplicationPhase) {
         info!(
-            "Table {} phase changing from '{:?}' to '{:?}'",
-            self.table_id, self.table_replication_phase, phase
+            "Table phase changing from '{:?}' to '{:?}'",
+            self.table_replication_phase, phase
         );
 
         self.table_replication_phase = phase;
@@ -89,10 +89,7 @@ impl TableSyncWorkerStateInner {
 
         // If we should store this phase change, we want to do it via the supplied state store.
         if phase.as_type().should_store() {
-            info!(
-                "Storing phase change '{:?}' for table {:?}",
-                phase, self.table_id,
-            );
+            info!("Storing phase change '{:?}' for table", phase);
 
             state_store
                 .update_table_replication_state(self.table_id, phase)
@@ -288,7 +285,7 @@ where
             .get_table_replication_state(self.table_id)
             .await?
         else {
-            warn!(
+            error!(
                 "No replication state found for table {}, cannot start sync worker",
                 self.table_id
             );
@@ -299,8 +296,10 @@ where
         let state = TableSyncWorkerState::new(self.table_id, relation_subscription_state);
 
         let state_clone = state.clone();
+        let table_sync_worker_span =
+            tracing::info_span!("table_sync_worker", table_id = self.table_id);
         let table_sync_worker = async move {
-            info!(
+            debug!(
                 "Waiting to acquire a running permit for table sync worker for table {}",
                 self.table_id
             );
@@ -318,6 +317,11 @@ where
                     permit
                 }
             };
+
+            debug!(
+                "Acquired a running permit for table sync worker for table {}",
+                self.table_id
+            );
 
             let replication_client =
                 PgReplicationClient::connect(self.config.pg_connection.clone()).await?;
@@ -365,11 +369,9 @@ where
 
         // We spawn the table sync worker with a safe future, so that we can have controlled teardown
         // on completion or error.
-        let handle = tokio::spawn(ReactiveFuture::new(
-            table_sync_worker,
-            self.table_id,
-            self.pool.workers(),
-        ));
+        let fut = ReactiveFuture::new(table_sync_worker, self.table_id, self.pool.workers())
+            .instrument(table_sync_worker_span);
+        let handle = tokio::spawn(fut);
 
         Ok(TableSyncWorkerHandle {
             state,
