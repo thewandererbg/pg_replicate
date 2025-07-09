@@ -13,8 +13,8 @@ use api::{
     encryption::{self, generate_random_key},
     startup::run,
 };
-use config::load_config;
 use config::shared::PgConnectionConfig;
+use config::{Environment, load_config};
 use postgres::sqlx::test_utils::drop_pg_database;
 use reqwest::{IntoUrl, RequestBuilder};
 use std::io;
@@ -370,6 +370,9 @@ impl TestApp {
 }
 
 pub async fn spawn_test_app() -> TestApp {
+    // We set the environment to dev.
+    Environment::Dev.set();
+
     let base_address = "127.0.0.1";
     let listener =
         TcpListener::bind(format!("{base_address}:0")).expect("failed to bind random port");
