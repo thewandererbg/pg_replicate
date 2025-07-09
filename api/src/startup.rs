@@ -6,6 +6,7 @@ use aws_lc_rs::aead::{AES_256_GCM, RandomizedNonceKey};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use config::shared::{IntoConnectOptions, PgConnectionConfig};
 use sqlx::{PgPool, postgres::PgPoolOptions};
+use tracing::warn;
 use tracing_actix_web::TracingLogger;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -85,13 +86,22 @@ impl Application {
             key,
         };
         let api_key = configuration.api_key;
-        let k8s_client = HttpK8sClient::new().await?;
+        let k8s_client = match HttpK8sClient::new().await {
+            Ok(client) => Some(client),
+            Err(e) => {
+                warn!(
+                    "Failed to create Kubernetes client: {}. Running without Kubernetes support.",
+                    e
+                );
+                None
+            }
+        };
         let server = run(
             listener,
             connection_pool,
             encryption_key,
             api_key,
-            Some(k8s_client),
+            k8s_client,
         )
         .await?;
 
@@ -223,6 +233,12 @@ pub async fn run(
         let tracing_middleware = TracingLogger::<ApiRootSpanBuilder>::new();
         let authentication = HttpAuthentication::bearer(auth_validator);
         let app = App::new()
+            .wrap(
+                sentry::integrations::actix::Sentry::builder()
+                    .capture_server_errors(true)
+                    .start_transaction(true)
+                    .finish(),
+            )
             .wrap(tracing_middleware)
             .service(health_check)
             .service(
@@ -283,6 +299,7 @@ pub async fn run(
             .app_data(connection_pool.clone())
             .app_data(encryption_key.clone())
             .app_data(api_key.clone());
+
         if let Some(k8s_client) = k8s_client.clone() {
             app.app_data(k8s_client.clone())
         } else {
