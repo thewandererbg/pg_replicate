@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio::sync::{AcquireError, Notify, RwLock, RwLockReadGuard, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_postgres::types::PgLsn;
-use tracing::{Instrument, debug, error, info};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::concurrency::future::ReactiveFuture;
 use crate::concurrency::shutdown::{ShutdownResult, ShutdownRx};
@@ -201,6 +201,8 @@ impl TableSyncWorkerState {
 
                 // Shutdown signal received, exit loop.
                 _ = shutdown_rx.changed() => {
+                    info!("shutdown signal received, cancelling the wait for phase type {:?}", phase_type);
+
                     return ShutdownResult::Shutdown(());
                 }
 
@@ -325,7 +327,7 @@ where
             // number of cocurrent connections to the source database.
             let permit = tokio::select! {
                 _ = self.shutdown_rx.changed() => {
-                    info!("shutting down table sync worker while waiting for a run permit");
+                    info!("shutting down table sync worker for table {} while waiting for a run permit", self.table_id);
 
                     return Ok(());
                 }
@@ -335,8 +337,8 @@ where
                 }
             };
 
-            debug!(
-                "acquired a running permit for table sync worker for table {}",
+            info!(
+                "acquired running permit for table sync worker for table {}",
                 self.table_id
             );
 
@@ -364,15 +366,10 @@ where
                 Ok(TableSyncResult::SyncStopped | TableSyncResult::SyncNotRequired) => {
                     return Ok(());
                 }
-                Ok(TableSyncResult::SyncCompleted { start_lsn }) => {
-                    info!(
-                        "table {} sync completed, starting apply loop from lsn {}",
-                        self.table_id, start_lsn
-                    );
-                    start_lsn
-                }
+                Ok(TableSyncResult::SyncCompleted { start_lsn }) => start_lsn,
                 Err(err) => {
                     error!("table sync failed for table {}: {}", self.table_id, err);
+
                     return Err(err.into());
                 }
             };
@@ -405,25 +402,32 @@ where
             )
             .await;
             match result {
+                Ok(Ok(())) => {
+                    info!(
+                        "successfully deleted replication slot '{}' for table {}",
+                        slot_name, self.table_id
+                    );
+                }
                 Ok(Err(err)) => {
-                    error!(
+                    warn!(
                         "failed to delete the replication slot {slot_name} of the table sync worker {}: {err}",
                         self.table_id
                     )
                 }
                 Err(_) => {
-                    error!(
+                    warn!(
                         "failed to delete the replication slot {slot_name} of the table sync worker {} due to timeout",
                         self.table_id
                     );
                 }
-                _ => {}
             }
 
             // This explicit drop is not strictly necessary but is added to make it extra clear
             // that the scope of the run permit is needed upto here to avoid multiple parallel
             // connections.
             drop(permit);
+
+            info!("table sync worker {} completed successfully", self.table_id);
 
             Ok(())
         };
