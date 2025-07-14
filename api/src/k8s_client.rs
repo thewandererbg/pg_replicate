@@ -10,7 +10,7 @@ use tracing::*;
 
 use kube::{
     Client,
-    api::{Api, DeleteParams, Patch, PatchParams},
+    api::{Api, DeleteParams, LogParams, Patch, PatchParams},
 };
 
 #[derive(Debug, Error)]
@@ -28,6 +28,13 @@ pub enum PodPhase {
     Succeeded,
     Failed,
     Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContainerError {
+    pub exit_code: Option<i32>,
+    pub message: Option<String>,
+    pub reason: Option<String>,
 }
 
 impl From<&str> for PodPhase {
@@ -80,6 +87,18 @@ pub trait K8sClient {
     async fn delete_stateful_set(&self, prefix: &str) -> Result<(), K8sError>;
 
     async fn get_pod_phase(&self, prefix: &str) -> Result<PodPhase, K8sError>;
+
+    async fn get_replicator_container_error(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<ContainerError>, K8sError>;
+
+    async fn get_container_logs(
+        &self,
+        pod_name: &str,
+        container_name: &str,
+        previous: bool,
+    ) -> Result<String, K8sError>;
 
     async fn delete_pod(&self, prefix: &str) -> Result<(), K8sError>;
 }
@@ -442,6 +461,7 @@ impl K8sClient for HttpK8sClient {
 
     async fn delete_stateful_set(&self, prefix: &str) -> Result<(), K8sError> {
         info!("deleting stateful set");
+
         let stateful_set_name = format!("{prefix}-{STATEFUL_SET_NAME_SUFFIX}");
         let dp = DeleteParams::default();
         match self.stateful_sets_api.delete(&stateful_set_name, &dp).await {
@@ -457,24 +477,30 @@ impl K8sClient for HttpK8sClient {
         }
         self.delete_pod(prefix).await?;
         info!("deleted stateful set");
+
         Ok(())
     }
 
     async fn get_pod_phase(&self, prefix: &str) -> Result<PodPhase, K8sError> {
         info!("getting pod status");
+
         let pod_name = format!("{prefix}-{STATEFUL_SET_NAME_SUFFIX}-0");
         let pod = match self.pods_api.get(&pod_name).await {
             Ok(pod) => pod,
-            Err(e) => match e {
-                kube::Error::Api(ref er) => {
-                    if er.code == 404 {
-                        return Ok(PodPhase::Succeeded);
+            Err(e) => {
+                return match e {
+                    kube::Error::Api(ref er) => {
+                        if er.code == 404 {
+                            return Ok(PodPhase::Succeeded);
+                        }
+
+                        Err(e.into())
                     }
-                    return Err(e.into());
-                }
-                e => return Err(e.into()),
-            },
+                    e => Err(e.into()),
+                };
+            }
         };
+
         let phase = pod
             .status
             .map(|status| {
@@ -488,11 +514,76 @@ impl K8sClient for HttpK8sClient {
                 phase
             })
             .unwrap_or(PodPhase::Unknown);
+
         Ok(phase)
+    }
+
+    async fn get_replicator_container_error(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<ContainerError>, K8sError> {
+        info!("getting replicator error information");
+
+        let pod_name = format!("{prefix}-{STATEFUL_SET_NAME_SUFFIX}-0");
+        let pod = match self.pods_api.get(&pod_name).await {
+            Ok(pod) => pod,
+            Err(e) => {
+                return match e {
+                    kube::Error::Api(ref er) => {
+                        if er.code == 404 {
+                            return Ok(None);
+                        }
+                        Err(e.into())
+                    }
+                    e => Err(e.into()),
+                };
+            }
+        };
+
+        let replicator_container_name = format!("{prefix}-{REPLICATOR_CONTAINER_NAME_SUFFIX}");
+
+        // Find the replicator container status
+        let container_status = pod.status.and_then(|status| {
+            status.container_statuses.and_then(|container_statuses| {
+                container_statuses
+                    .iter()
+                    .find(|cs| cs.name == replicator_container_name)
+                    .cloned()
+            })
+        });
+
+        let Some(container_status) = container_status else {
+            return Ok(None);
+        };
+
+        // Check last terminated state.
+        //
+        // `last_state` is only set when there’s a previous termination, and remains empty if the
+        // container has never failed, so this is what we want, having access to the previous failure
+        if let Some(last_state) = &container_status.last_state {
+            if let Some(terminated) = &last_state.terminated {
+                if terminated.exit_code != 0 {
+                    // Fetch logs from the previous container run
+                    let log_message = self
+                        .get_container_logs(&pod_name, &replicator_container_name, true)
+                        .await
+                        .ok();
+
+                    return Ok(Some(ContainerError {
+                        exit_code: Some(terminated.exit_code),
+                        message: log_message.or_else(|| terminated.message.clone()),
+                        reason: terminated.reason.clone(),
+                    }));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     async fn delete_pod(&self, prefix: &str) -> Result<(), K8sError> {
         info!("deleting pod");
+
         let pod_name = format!("{prefix}-{STATEFUL_SET_NAME_SUFFIX}-0");
         let dp = DeleteParams::default();
         match self.pods_api.delete(&pod_name, &dp).await {
@@ -507,6 +598,26 @@ impl K8sClient for HttpK8sClient {
             },
         }
         info!("deleted pod");
+
         Ok(())
+    }
+
+    async fn get_container_logs(
+        &self,
+        pod_name: &str,
+        container_name: &str,
+        previous: bool,
+    ) -> Result<String, K8sError> {
+        let log_params = LogParams {
+            container: Some(container_name.to_string()),
+            tail_lines: Some(50), // Get last 50 lines
+            timestamps: false,
+            previous, // Get logs from previous container instance or not
+            ..Default::default()
+        };
+
+        let logs = self.pods_api.logs(pod_name, &log_params).await?;
+
+        Ok(logs)
     }
 }
