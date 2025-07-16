@@ -198,7 +198,12 @@ impl BatchDestination for BigQueryBatchDestination {
         }
 
         self.client
-            .stream_rows(&self.dataset_id, table_name, &table_descriptor, &table_rows)
+            .stream_rows(
+                &self.dataset_id,
+                &table_name,
+                &table_descriptor,
+                &table_rows,
+            )
             .await?;
 
         Ok(())
@@ -296,12 +301,19 @@ impl BatchDestination for BigQueryBatchDestination {
                 CdcEvent::Type(_) => {}
             }
         }
+
         for (table_id, table_rows) in table_name_to_table_rows {
             let table_schema = self.get_table_schema(table_id)?;
             let table_name = Self::table_name_in_bq(&table_schema.name);
             let table_descriptor = table_schema_to_descriptor(table_schema);
+
             self.client
-                .stream_rows(&self.dataset_id, table_name, &table_descriptor, &table_rows)
+                .upsert_rows(
+                    &self.dataset_id,
+                    &table_name,
+                    &table_descriptor,
+                    &table_rows,
+                )
                 .await?;
         }
 

@@ -13,6 +13,6 @@ destination:
     project_id: "vigo-riders"
     dataset_id: "dmsin_test"
     gcp_sa_key_path: "./key_bq.json"
-    max_staleness_mins: 1
+    max_staleness_mins: 0
 state_store:
   memory:

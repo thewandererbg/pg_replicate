@@ -211,7 +211,7 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                     }
                 }
                 _ = ping_interval.tick() => {
-                    info!("ping server with lsn: {current_lsn}");
+                    // info!("ping server with lsn: {current_lsn}");
                     let inner = unsafe {
                         batch_timeout_stream
                             .as_mut()

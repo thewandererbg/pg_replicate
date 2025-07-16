@@ -3,6 +3,7 @@ use std::{collections::HashSet, fs};
 use bytes::{Buf, BufMut};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use futures::StreamExt;
+use gcp_bigquery_client::model::table::Table;
 use gcp_bigquery_client::storage::{ColumnMode, StorageApi};
 use gcp_bigquery_client::yup_oauth2::parse_service_account_key;
 use gcp_bigquery_client::{
@@ -215,7 +216,11 @@ impl BigQueryClient {
     }
 
     fn max_staleness_option(max_staleness_mins: u16) -> String {
-        format!("options (max_staleness = interval {max_staleness_mins} minute)")
+        if max_staleness_mins == 0 {
+            "".to_string()
+        } else {
+            format!("options (max_staleness = interval {max_staleness_mins} minute)")
+        }
     }
 
     fn partition_option(column_schemas: &[ColumnSchema]) -> String {
@@ -264,26 +269,37 @@ impl BigQueryClient {
     }
 
     pub async fn table_exists(&self, dataset_id: &str, table_name: &str) -> Result<bool, BQError> {
-        let query = format!(
-            "select exists
-                (
-                    select * from
-                    {dataset_id}.INFORMATION_SCHEMA.TABLES
-                    where table_name = '{table_name}'
-                ) as table_exists;",
-        );
-
-        let mut rs = self.query(query).await?;
-
-        let mut exists = false;
-
-        if rs.next_row() {
-            exists = rs
-                .get_bool_by_name("table_exists")?
-                .expect("no column named `table_exists` found in query result");
+        match self
+            .client
+            .table()
+            .get(&self.project_id, dataset_id, table_name, None)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.to_string().contains("Not found") || e.to_string().contains("404") => {
+                Ok(false)
+            }
+            Err(e) => Err(e),
         }
+    }
 
-        Ok(exists)
+    pub async fn get_table_info(
+        &self,
+        dataset_id: &str,
+        table_name: &str,
+    ) -> Result<Option<Table>, BQError> {
+        match self
+            .client
+            .table()
+            .get(&self.project_id, dataset_id, table_name, None)
+            .await
+        {
+            Ok(table) => Ok(Some(table)),
+            Err(e) if e.to_string().contains("Not found") || e.to_string().contains("404") => {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn get_last_lsn(&self, dataset_id: &str) -> Result<PgLsn, BQError> {
@@ -375,7 +391,7 @@ impl BigQueryClient {
     pub async fn stream_rows(
         &mut self,
         dataset_id: &str,
-        table_name: String,
+        table_name: &str,
         table_descriptor: &TableDescriptor,
         mut table_rows: &[TableRow],
     ) -> Result<(), BQError> {
@@ -625,11 +641,25 @@ impl BigQueryClient {
     }
 
     async fn query(&self, query: String) -> Result<ResultSet, BQError> {
+        info!("Query: {}", query);
         let query_response = self
             .client
             .job()
             .query(&self.project_id, QueryRequest::new(query))
             .await?;
+
+        // Print cost information
+        if let Some(bytes_str) = &query_response.total_bytes_processed {
+            if let Ok(bytes_processed) = bytes_str.parse::<u64>() {
+                let cost_usd = (bytes_processed as f64 / 1_000_000_000_000.0) * 6.25; // $6.25 per TB
+                info!(
+                    "Query processed {:.0} MB, estimated cost: ${:.4}",
+                    bytes_processed as f64 / 1_000_000.0,
+                    cost_usd
+                );
+            }
+        }
+
         Ok(ResultSet::new_from_query_response(query_response))
     }
 
@@ -657,23 +687,308 @@ impl BigQueryClient {
         dataset_id: &str,
         table_name: &str,
     ) -> Result<HashSet<String>, BQError> {
-        let query = format!(
-            "SELECT column_name
-             FROM `{}.{}.INFORMATION_SCHEMA.COLUMNS`
-             WHERE table_name = '{}'",
-            self.project_id, dataset_id, table_name
-        );
-
-        let mut rs = self.query(query).await?;
+        let table = self
+            .client
+            .table()
+            .get(&self.project_id, dataset_id, table_name, None)
+            .await?;
 
         let mut columns = HashSet::new();
-        while rs.next_row() {
-            if let Some(column_name) = rs.get_string_by_name("column_name")? {
-                columns.insert(column_name);
+
+        if let Some(fields) = table.schema.fields {
+            for field in fields {
+                columns.insert(field.name);
             }
         }
 
         Ok(columns)
+    }
+
+    pub async fn upsert_rows(
+        &mut self,
+        dataset_id: &str,
+        base_table: &str,
+        table_descriptor: &TableDescriptor,
+        update_rows: &[TableRow],
+    ) -> Result<(), BQError> {
+        let table_info = self.get_table_info(dataset_id, base_table).await?;
+        let table_info = match table_info {
+            Some(info) => info,
+            None => {
+                return Err(BQError::NoDataAvailable);
+            }
+        };
+
+        let partition_type = self.get_partition_type(&table_info);
+        let partition_column = self.get_partition_column(&table_info);
+
+        let num_bytes = table_info
+            .num_bytes
+            .unwrap_or("0".to_string())
+            .parse()
+            .unwrap_or(0);
+        let streaming_buffer = table_info.streaming_buffer.is_some();
+
+        info!("{} size: {} bytes", base_table, num_bytes);
+        info!("{} has streaming buffer: {}", base_table, streaming_buffer);
+        info!("{} has partition column: {}", base_table, partition_column);
+
+        // 10MB is the minimum bytesbilled for any query.
+        // So we need to check if the table is large enough to use partition replacement
+        // Stream directly into table if it's small enough
+        if partition_type == "NONE"
+            || partition_column == ""
+            || streaming_buffer
+            || num_bytes < 20 * 1024 * 1024
+        {
+            info!("Streaming rows into {}", base_table);
+            self.stream_rows(dataset_id, base_table, table_descriptor, update_rows)
+                .await?;
+        } else {
+            info!(
+                "Inserting rows into {} by partition replacement",
+                base_table
+            );
+            self.insert_rows_by_partition_replacement(
+                dataset_id,
+                base_table,
+                table_descriptor,
+                update_rows,
+                &partition_column,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn insert_rows_by_partition_replacement(
+        &mut self,
+        dataset_id: &str,
+        base_table: &str,
+        table_descriptor: &TableDescriptor,
+        update_rows: &[TableRow],
+        partition_column: &str,
+    ) -> Result<(), BQError> {
+        let temp_table = format!("{}_temp_{}", base_table, Utc::now().timestamp());
+
+        let affected_partitions = self
+            .get_affected_partitions(
+                update_rows,
+                table_descriptor,
+                dataset_id,
+                base_table,
+                partition_column,
+            )
+            .await?;
+
+        info!("Affected partitions: {:?}", affected_partitions);
+
+        // 1. Create temp table with final desired state
+        self.create_final_state_table(
+            dataset_id,
+            &temp_table,
+            base_table,
+            table_descriptor,
+            update_rows,
+            &affected_partitions,
+        )
+        .await?;
+
+        // 2. Replace partitions
+        self.execute_partition_replacement(
+            dataset_id,
+            base_table,
+            &temp_table,
+            &affected_partitions,
+        )
+        .await?;
+
+        // 3. Cleanup
+        self.drop_table(dataset_id, &temp_table).await?;
+
+        Ok(())
+    }
+
+    async fn create_final_state_table(
+        &mut self,
+        dataset_id: &str,
+        temp_table: &str,
+        base_table: &str,
+        table_descriptor: &TableDescriptor,
+        update_rows: &[TableRow],
+        affected_partitions: &[String],
+    ) -> Result<(), BQError> {
+        // 1. Create empty temp table with same schema as base table
+        self.create_temp_table_like_base(dataset_id, temp_table, base_table)
+            .await?;
+
+        // 2. Copy existing data from unaffected partitions to temp table
+        self.copy_existing_data_to_temp(dataset_id, base_table, temp_table, &affected_partitions)
+            .await?;
+
+        // 3. Add the new/updated records via streaming
+        self.stream_rows(dataset_id, temp_table, table_descriptor, update_rows)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn create_temp_table_like_base(
+        &mut self,
+        dataset_id: &str,
+        temp_table: &str,
+        base_table: &str,
+    ) -> Result<(), BQError> {
+        let query = format!(
+            r#"
+             CREATE TABLE `{}.{}.{}`
+             LIKE `{}.{}.{}`
+             "#,
+            self.project_id, dataset_id, temp_table, self.project_id, dataset_id, base_table
+        );
+
+        self.query(query).await?;
+        Ok(())
+    }
+
+    async fn get_affected_partitions(
+        &self,
+        update_rows: &[TableRow],
+        table_descriptor: &TableDescriptor,
+        dataset_id: &str,
+        table_name: &str,
+        partition_column: &str,
+    ) -> Result<Vec<String>, BQError> {
+        let mut partitions = HashSet::new();
+        let mut delete_ids = Vec::new();
+
+        // Find the id field index once
+        let id_field_index = table_descriptor
+            .field_descriptors
+            .iter()
+            .position(|field| field.name == "id")
+            .ok_or_else(|| BQError::InvalidColumnName {
+                col_name: "id".to_string(),
+            })?;
+
+        // Process rows
+        for row in update_rows {
+            if row.is_delete() {
+                // Extract id for delete rows
+                let id_cell = &row.values[id_field_index];
+                let mut id_value = String::new();
+                Self::cell_to_query_value(id_cell, &mut id_value);
+                delete_ids.push(id_value);
+            } else {
+                // Get partition date for non-delete rows
+                let partition_date = row
+                    .get_partition_date(table_descriptor, partition_column)
+                    .map_err(|e| BQError::InvalidColumnName {
+                        col_name: format!("{}: {}", partition_column, e),
+                    })?;
+                partitions.insert(partition_date);
+            }
+        }
+
+        // Query partitions for delete rows if any exist
+        if !delete_ids.is_empty() {
+            let query = format!(
+                "SELECT DISTINCT FORMAT_DATE('%Y-%m-%d', {}) AS partition_date FROM `{}.{}.{}` WHERE id IN ({})",
+                partition_column, self.project_id, dataset_id, table_name, delete_ids.join(", ")
+            );
+
+            let mut result_set = self.query(query).await?;
+            while result_set.next_row() {
+                let partition_date = result_set
+                    .get_string_by_name("partition_date")?
+                    .ok_or(BQError::NoDataAvailable)?;
+                partitions.insert(partition_date);
+            }
+        }
+
+        Ok(partitions.into_iter().collect())
+    }
+
+    async fn copy_existing_data_to_temp(
+        &mut self,
+        dataset_id: &str,
+        base_table: &str,
+        temp_table: &str,
+        affected_partitions: &[String],
+    ) -> Result<(), BQError> {
+        let partition_filter = affected_partitions
+            .iter()
+            .map(|p| format!("'{}'", p))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let copy_query = format!(
+            r#"
+            INSERT INTO `{}.{}.{}`
+            SELECT * FROM `{}.{}.{}`
+            WHERE DATE(created_at) IN ({})
+            "#,
+            self.project_id,
+            dataset_id,
+            temp_table,
+            self.project_id,
+            dataset_id,
+            base_table,
+            partition_filter
+        );
+
+        self.query(copy_query).await?;
+        Ok(())
+    }
+
+    async fn execute_partition_replacement(
+        &mut self,
+        dataset_id: &str,
+        base_table: &str,
+        temp_table: &str,
+        affected_partitions: &[String],
+    ) -> Result<(), BQError> {
+        let partition_filter = affected_partitions
+            .iter()
+            .map(|p| format!("'{}'", p))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let merge_query = format!(
+            r#"
+                MERGE `{}.{}.{}` T
+                USING `{}.{}.{}` S
+                ON FALSE
+                WHEN NOT MATCHED BY SOURCE AND DATE(T.created_at) IN ({}) THEN DELETE
+                WHEN NOT MATCHED THEN INSERT ROW
+            "#,
+            self.project_id,
+            dataset_id,
+            base_table,
+            self.project_id,
+            dataset_id,
+            temp_table,
+            partition_filter
+        );
+
+        self.query(merge_query).await?;
+        Ok(())
+    }
+
+    fn get_partition_type(&mut self, table: &Table) -> String {
+        table
+            .time_partitioning
+            .as_ref()
+            .map(|tp| tp.r#type.clone())
+            .unwrap_or("NONE".to_string())
+    }
+
+    fn get_partition_column(&mut self, table: &Table) -> String {
+        table
+            .time_partitioning
+            .as_ref()
+            .and_then(|tp| tp.field.clone())
+            .unwrap_or("".to_string())
     }
 }
 
@@ -1188,4 +1503,53 @@ pub fn table_schema_to_descriptor(table_schema: &TableSchema) -> TableDescriptor
     });
 
     TableDescriptor { field_descriptors }
+}
+
+impl TableRow {
+    pub fn get_partition_date(
+        &self,
+        table_descriptor: &TableDescriptor,
+        partition_column: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        // Find the "created_at" column position in the table descriptor
+        let created_at_index = table_descriptor
+            .field_descriptors
+            .iter()
+            .position(|field| field.name == partition_column)
+            .ok_or(format!(
+                "Partition column '{}' not found in table descriptor",
+                partition_column,
+            ))?;
+
+        match self.values.get(created_at_index) {
+            Some(Cell::Date(date)) => Ok(date.format("%Y-%m-%d").to_string()),
+            Some(Cell::TimeStamp(datetime)) => Ok(datetime.date().format("%Y-%m-%d").to_string()),
+            Some(Cell::TimeStampTz(datetime)) => {
+                Ok(datetime.date_naive().format("%Y-%m-%d").to_string())
+            }
+            Some(Cell::String(date_str)) => {
+                // Try to parse string as date
+                if let Ok(parsed_date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                    Ok(parsed_date.format("%Y-%m-%d").to_string())
+                } else if let Ok(parsed_datetime) =
+                    NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M:%S")
+                {
+                    Ok(parsed_datetime.date().format("%Y-%m-%d").to_string())
+                } else if let Ok(parsed_datetime) =
+                    NaiveDateTime::parse_from_str(date_str, "%Y-%m-%dT%H:%M:%S")
+                {
+                    Ok(parsed_datetime.date().format("%Y-%m-%d").to_string())
+                } else {
+                    Err(format!("Could not parse date from string: {}", date_str).into())
+                }
+            }
+            Some(Cell::Null) => Err("Partition date cannot be null".into()),
+            Some(other) => Err(format!("Unexpected date type: {:?}", other).into()),
+            None => Err("Created_at column index out of bounds".into()),
+        }
+    }
+
+    pub fn is_delete(&self) -> bool {
+        self.values[self.values.len() - 2] == Cell::String("DELETE".to_string())
+    }
 }
