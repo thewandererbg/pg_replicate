@@ -1061,8 +1061,8 @@ impl Cell {
                 ::prost::encoding::double::encode(tag, i, buf);
             }
             Cell::Numeric(n) => {
-                let s = n.to_string();
-                ::prost::encoding::string::encode(tag, &s, buf);
+                let f = n.to_f64();
+                ::prost::encoding::double::encode(tag, &f, buf);
             }
             Cell::Date(t) => {
                 let s = t.format("%Y-%m-%d").to_string();
@@ -1114,8 +1114,8 @@ impl Cell {
             Cell::F32(i) => ::prost::encoding::float::encoded_len(tag, i),
             Cell::F64(i) => ::prost::encoding::double::encoded_len(tag, i),
             Cell::Numeric(n) => {
-                let s = n.to_string();
-                ::prost::encoding::string::encoded_len(tag, &s)
+                let f = n.to_f64();
+                ::prost::encoding::double::encoded_len(tag, &f)
             }
             Cell::Date(t) => {
                 let s = t.format("%Y-%m-%d").to_string();
@@ -1214,12 +1214,12 @@ impl ArrayCell {
                 ::prost::encoding::double::encode_packed(tag, &vec, buf);
             }
             ArrayCell::Numeric(mut vec) => {
-                let vec: Vec<String> = vec
+                let vec: Vec<f64> = vec
                     .drain(..)
                     .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().to_string())
+                    .map(|v| v.unwrap().to_f64())
                     .collect();
-                ::prost::encoding::string::encode_repeated(tag, &vec, buf);
+                ::prost::encoding::double::encode_repeated(tag, &vec, buf);
             }
             ArrayCell::Date(mut vec) => {
                 let vec: Vec<String> = vec
@@ -1316,12 +1316,12 @@ impl ArrayCell {
                 ::prost::encoding::double::encoded_len_packed(tag, &vec)
             }
             ArrayCell::Numeric(mut vec) => {
-                let vec: Vec<String> = vec
+                let vec: Vec<f64> = vec
                     .drain(..)
                     .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().to_string())
+                    .map(|v| v.unwrap().to_f64())
                     .collect();
-                ::prost::encoding::string::encoded_len_repeated(tag, &vec)
+                ::prost::encoding::double::encoded_len_repeated(tag, &vec)
             }
             ArrayCell::Date(mut vec) => {
                 let vec: Vec<String> = vec
@@ -1420,7 +1420,7 @@ pub fn table_schema_to_descriptor(table_schema: &TableSchema) -> TableDescriptor
             Type::INT8 => ColumnType::Int64,
             Type::FLOAT4 => ColumnType::Float,
             Type::FLOAT8 => ColumnType::Double,
-            Type::NUMERIC => ColumnType::String,
+            Type::NUMERIC => ColumnType::Double,
             Type::DATE => ColumnType::String,
             Type::TIME => ColumnType::String,
             Type::TIMESTAMP => ColumnType::String,
@@ -1441,7 +1441,7 @@ pub fn table_schema_to_descriptor(table_schema: &TableSchema) -> TableDescriptor
             Type::INT8_ARRAY => ColumnType::Int64,
             Type::FLOAT4_ARRAY => ColumnType::Float,
             Type::FLOAT8_ARRAY => ColumnType::Double,
-            Type::NUMERIC_ARRAY => ColumnType::String,
+            Type::NUMERIC_ARRAY => ColumnType::Double,
             Type::DATE_ARRAY => ColumnType::String,
             Type::TIME_ARRAY => ColumnType::String,
             Type::TIMESTAMP_ARRAY => ColumnType::String,
@@ -1551,5 +1551,16 @@ impl TableRow {
 
     pub fn is_delete(&self) -> bool {
         self.values[self.values.len() - 2] == Cell::String("DELETE".to_string())
+    }
+}
+
+impl PgNumeric {
+    pub fn to_f64(&self) -> f64 {
+        match self {
+            PgNumeric::NaN => f64::NAN,
+            PgNumeric::PositiveInf => f64::INFINITY,
+            PgNumeric::NegativeInf => f64::NEG_INFINITY,
+            PgNumeric::Value(bd) => bd.to_string().parse::<f64>().unwrap_or(f64::NAN),
+        }
     }
 }
