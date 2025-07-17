@@ -1,6 +1,6 @@
 pipeline:
   id: 1
-  publication_name: "my_publication"
+  publication_name: "bqpub"
   batch:
     max_size: 100000
-    max_fill_ms: 20000
+    max_fill_ms: 60000

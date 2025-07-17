@@ -212,7 +212,7 @@ impl BatchDestination for BigQueryBatchDestination {
     async fn write_cdc_events(&mut self, events: Vec<CdcEvent>) -> Result<PgLsn, Self::Error> {
         let mut table_name_to_table_rows = HashMap::new();
         let mut new_last_lsn = PgLsn::from(0);
-        for event in events {
+        for (i, event) in events.into_iter().enumerate() {
             // info!("{event:?}");
             match event {
                 CdcEvent::Begin(begin_body) => {
@@ -235,27 +235,33 @@ impl BatchDestination for BigQueryBatchDestination {
                 }
                 CdcEvent::Insert((table_id, mut table_row)) => {
                     table_row.values.push(Cell::String("UPSERT".to_string()));
-                    table_row
-                        .values
-                        .push(Cell::String(self.final_lsn.unwrap().to_string()));
+                    table_row.values.push(Cell::String(format!(
+                        "{}/{:X}",
+                        self.final_lsn.unwrap().to_string(),
+                        i
+                    )));
                     let table_rows: &mut Vec<TableRow> =
                         table_name_to_table_rows.entry(table_id).or_default();
                     table_rows.push(table_row);
                 }
                 CdcEvent::Update((table_id, mut table_row)) => {
                     table_row.values.push(Cell::String("UPSERT".to_string()));
-                    table_row
-                        .values
-                        .push(Cell::String(self.final_lsn.unwrap().to_string()));
+                    table_row.values.push(Cell::String(format!(
+                        "{}/{:X}",
+                        self.final_lsn.unwrap().to_string(),
+                        i
+                    )));
                     let table_rows: &mut Vec<TableRow> =
                         table_name_to_table_rows.entry(table_id).or_default();
                     table_rows.push(table_row);
                 }
                 CdcEvent::Delete((table_id, mut table_row)) => {
                     table_row.values.push(Cell::String("DELETE".to_string()));
-                    table_row
-                        .values
-                        .push(Cell::String(self.final_lsn.unwrap().to_string()));
+                    table_row.values.push(Cell::String(format!(
+                        "{}/{:X}",
+                        self.final_lsn.unwrap().to_string(),
+                        i
+                    )));
                     let table_rows: &mut Vec<TableRow> =
                         table_name_to_table_rows.entry(table_id).or_default();
                     table_rows.push(table_row);

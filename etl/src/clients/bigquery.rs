@@ -658,6 +658,8 @@ impl BigQueryClient {
                     cost_usd
                 );
             }
+        } else {
+            info!("Query response: {:?}", query_response);
         }
 
         Ok(ResultSet::new_from_query_response(query_response))
@@ -819,12 +821,14 @@ impl BigQueryClient {
         affected_partitions: &[String],
     ) -> Result<(), BQError> {
         // 1. Create empty temp table with same schema as base table
-        self.create_temp_table_like_base(dataset_id, temp_table, base_table)
-            .await?;
-
         // 2. Copy existing data from unaffected partitions to temp table
-        self.copy_existing_data_to_temp(dataset_id, base_table, temp_table, &affected_partitions)
-            .await?;
+        self.create_temp_table_with_partition_data(
+            dataset_id,
+            temp_table,
+            base_table,
+            &affected_partitions,
+        )
+        .await?;
 
         // 3. Add the new/updated records via streaming
         self.stream_rows(dataset_id, temp_table, table_descriptor, update_rows)
@@ -833,18 +837,41 @@ impl BigQueryClient {
         Ok(())
     }
 
-    async fn create_temp_table_like_base(
+    async fn create_temp_table_with_partition_data(
         &mut self,
         dataset_id: &str,
         temp_table: &str,
         base_table: &str,
+        affected_partitions: &[String],
     ) -> Result<(), BQError> {
+        let partition_filter = affected_partitions
+            .iter()
+            .map(|p| format!("'{}'", p))
+            .collect::<Vec<_>>()
+            .join(",");
+
         let query = format!(
             r#"
              CREATE TABLE `{}.{}.{}`
-             LIKE `{}.{}.{}`
+             LIKE `{}.{}.{}`;
+
+             INSERT INTO `{}.{}.{}`
+             SELECT * FROM `{}.{}.{}`
+             WHERE DATE(created_at) IN ({});
              "#,
-            self.project_id, dataset_id, temp_table, self.project_id, dataset_id, base_table
+            self.project_id,
+            dataset_id,
+            temp_table,
+            self.project_id,
+            dataset_id,
+            base_table,
+            self.project_id,
+            dataset_id,
+            temp_table,
+            self.project_id,
+            dataset_id,
+            base_table,
+            partition_filter
         );
 
         self.query(query).await?;
@@ -906,39 +933,9 @@ impl BigQueryClient {
             }
         }
 
-        Ok(partitions.into_iter().collect())
-    }
-
-    async fn copy_existing_data_to_temp(
-        &mut self,
-        dataset_id: &str,
-        base_table: &str,
-        temp_table: &str,
-        affected_partitions: &[String],
-    ) -> Result<(), BQError> {
-        let partition_filter = affected_partitions
-            .iter()
-            .map(|p| format!("'{}'", p))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let copy_query = format!(
-            r#"
-            INSERT INTO `{}.{}.{}`
-            SELECT * FROM `{}.{}.{}`
-            WHERE DATE(created_at) IN ({})
-            "#,
-            self.project_id,
-            dataset_id,
-            temp_table,
-            self.project_id,
-            dataset_id,
-            base_table,
-            partition_filter
-        );
-
-        self.query(copy_query).await?;
-        Ok(())
+        let mut partitions_vec: Vec<String> = partitions.into_iter().collect();
+        partitions_vec.sort();
+        Ok(partitions_vec)
     }
 
     async fn execute_partition_replacement(
