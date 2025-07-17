@@ -366,6 +366,45 @@ impl K8sClient for HttpK8sClient {
                     "emptyDir": {}
                   }
                 ],
+                // We want to wait at most 60 seconds before K8S sends a `SIGKILL` to the containers.
+                "terminationGracePeriodSeconds": 60,
+                "initContainers": [
+                  {
+                    "name": vector_container_name,
+                    "image": VECTOR_IMAGE_NAME,
+                    "restartPolicy": "Always",
+                    "env": [
+                      {
+                        "name": "LOGFLARE_API_KEY",
+                        "valueFrom": {
+                          "secretKeyRef": {
+                            "name": LOGFLARE_SECRET_NAME,
+                            "key": "key"
+                          }
+                        }
+                      }
+                    ],
+                    "resources": {
+                      "limits": {
+                        "memory": "200Mi",
+                      },
+                      "requests": {
+                        "memory": "200Mi",
+                        "cpu": "100m"
+                      }
+                    },
+                    "volumeMounts": [
+                      {
+                        "name": VECTOR_CONFIG_FILE_VOLUME_NAME,
+                        "mountPath": "/etc/vector"
+                      },
+                      {
+                        "name": LOGS_VOLUME_NAME,
+                        "mountPath": "/var/log"
+                      }
+                    ]
+                  }
+                ],
                 "containers": [
                   {
                     "name": replicator_container_name,
@@ -404,40 +443,6 @@ impl K8sClient for HttpK8sClient {
                         "mountPath": "/app/logs"
                       },
                     ]
-                  },
-                  {
-                    "name": vector_container_name,
-                    "image": VECTOR_IMAGE_NAME,
-                    "env": [
-                      {
-                        "name": "LOGFLARE_API_KEY",
-                        "valueFrom": {
-                          "secretKeyRef": {
-                            "name": LOGFLARE_SECRET_NAME,
-                            "key": "key"
-                          }
-                        }
-                      }
-                    ],
-                    "resources": {
-                      "limits": {
-                        "memory": "200Mi",
-                      },
-                      "requests": {
-                        "memory": "200Mi",
-                        "cpu": "100m"
-                      }
-                    },
-                    "volumeMounts": [
-                      {
-                        "name": VECTOR_CONFIG_FILE_VOLUME_NAME,
-                        "mountPath": "/etc/vector"
-                      },
-                      {
-                        "name": LOGS_VOLUME_NAME,
-                        "mountPath": "/var/log"
-                      }
-                    ],
                   }
                 ]
               }

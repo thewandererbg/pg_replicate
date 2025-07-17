@@ -548,6 +548,9 @@ where
     // by the destination.
     let event = convert_message_to_event(schema_cache, &message).await?;
 
+    let event_type = EventType::from(&event);
+    debug!("message converted to event type {}", event_type);
+
     match message {
         LogicalReplicationMessage::Begin(message) => {
             handle_begin_message(state, event, &message).await
