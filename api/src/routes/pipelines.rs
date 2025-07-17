@@ -15,7 +15,6 @@ use std::sync::Arc;
 use thiserror::Error;
 use utoipa::ToSchema;
 
-use crate::config::ApiConfig;
 use crate::db;
 use crate::db::destinations::{Destination, DestinationsDbError, destination_exists};
 use crate::db::images::{Image, ImagesDbError};
@@ -452,7 +451,6 @@ pub async fn read_all_pipelines(
 #[post("/pipelines/{pipeline_id}/start")]
 pub async fn start_pipeline(
     req: HttpRequest,
-    api_config: Data<ApiConfig>,
     pool: Data<PgPool>,
     encryption_key: Data<EncryptionKey>,
     k8s_client: Data<Arc<HttpK8sClient>>,
@@ -469,7 +467,6 @@ pub async fn start_pipeline(
     create_or_update_pipeline_in_k8s(
         &k8s_client,
         tenant_id,
-        &api_config,
         pipeline,
         replicator,
         image,
@@ -628,7 +625,6 @@ pub async fn get_pipeline_status(
 #[post("/pipelines/{pipeline_id}/update-image")]
 pub async fn update_pipeline_image(
     req: HttpRequest,
-    api_config: Data<ApiConfig>,
     pool: Data<PgPool>,
     encryption_key: Data<EncryptionKey>,
     k8s_client: Option<Data<Arc<HttpK8sClient>>>,
@@ -677,7 +673,6 @@ pub async fn update_pipeline_image(
         create_or_update_pipeline_in_k8s(
             &k8s_client,
             tenant_id,
-            &api_config,
             pipeline,
             replicator,
             target_image,
@@ -701,7 +696,6 @@ struct Secrets {
 async fn create_or_update_pipeline_in_k8s(
     k8s_client: &HttpK8sClient,
     tenant_id: &str,
-    api_config: &ApiConfig,
     pipeline: Pipeline,
     replicator: Replicator,
     image: Image,
@@ -717,7 +711,6 @@ async fn create_or_update_pipeline_in_k8s(
     // We create the replicator configuration.
     let replicator_config = build_replicator_config(
         k8s_client,
-        api_config,
         source.config,
         destination.config,
         pipeline,
@@ -808,7 +801,6 @@ fn build_secrets(source_config: &SourceConfig, destination_config: &DestinationC
 
 async fn build_replicator_config(
     k8s_client: &HttpK8sClient,
-    api_config: &ApiConfig,
     source_config: SourceConfig,
     destination_config: DestinationConfig,
     pipeline: Pipeline,
@@ -857,7 +849,8 @@ async fn build_replicator_config(
     let config = ReplicatorConfig {
         destination: destination_config,
         pipeline: pipeline_config,
-        sentry: api_config.sentry.clone(),
+        // The Sentry config will be injected via env variables for security purposes.
+        sentry: None,
         supabase: Some(supabase_config),
     };
 
