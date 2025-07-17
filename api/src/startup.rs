@@ -233,7 +233,7 @@ pub async fn run(
     let openapi = ApiDoc::openapi();
 
     let server = HttpServer::new(move || {
-        let tracing_middleware = TracingLogger::<ApiRootSpanBuilder>::new();
+        let tracing_logger = TracingLogger::<ApiRootSpanBuilder>::new();
         let authentication = HttpAuthentication::bearer(auth_validator);
         let app = App::new()
             .wrap(
@@ -242,7 +242,7 @@ pub async fn run(
                     .start_transaction(true)
                     .finish(),
             )
-            .wrap(tracing_middleware)
+            .wrap(tracing_logger)
             .service(health_check)
             .service(
                 SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", openapi.clone()),
