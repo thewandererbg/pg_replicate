@@ -8,7 +8,7 @@ use tokio_postgres::types::PgLsn;
 use tracing::{debug, info};
 
 use crate::{
-    conversions::cdc_event::{CdcEvent, CdcEventConversionError},
+    conversions::cdc_event::CdcEventConversionError,
     pipeline::{
         batching::stream::BatchTimeoutStream,
         destinations::BatchDestination,
@@ -164,50 +164,58 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
         );
         pin!(batch_timeout_stream);
 
-        // Ping the postgresql database each 10s to keep connection alive
+        // Ping the postgresql database each 20s to keep connection alive
         // in case wal_sender_timeout < max_batch_fill_time
-        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut current_lsn = last_lsn.into();
 
         loop {
             tokio::select! {
-                Some(batch) = batch_timeout_stream.next() => {
-                    info!("got {} cdc events in a batch", batch.len());
-                    let mut send_status_update = false;
-                    let mut events = Vec::with_capacity(batch.len());
-                    for event in batch {
-                        if let Err(CdcStreamError::CdcEventConversion(
-                            CdcEventConversionError::MissingSchema(_),
-                        )) = event
-                        {
-                            continue;
-                        }
-                        let event = event.map_err(CommonSourceError::CdcStream)?;
-                        if let CdcEvent::KeepAliveRequested(keep_alive) = &event {
-                            send_status_update = keep_alive.reply();
-                        };
-                        events.push(event);
-                    }
-                    let last_lsn = self
-                        .destination
-                        .write_cdc_events(events)
-                        .await
-                        .map_err(PipelineError::Destination)?;
-                    current_lsn = last_lsn;
-                    if send_status_update {
-                        info!("sending status update with lsn: {last_lsn}");
-                        let inner = unsafe {
-                            batch_timeout_stream
+                batch_opt = batch_timeout_stream.next() => {
+                    match batch_opt {
+                        Some(batch) => {
+                            info!("got {} cdc events in a batch", batch.len());
+                            let mut events = Vec::with_capacity(batch.len());
+                            for event in batch {
+                                if let Err(CdcStreamError::CdcEventConversion(
+                                    CdcEventConversionError::MissingSchema(_),
+                                )) = event
+                                {
+                                    continue;
+                                }
+                                let event = event.map_err(CommonSourceError::CdcStream)?;
+                                events.push(event);
+                            }
+                            let last_lsn = self
+                                .destination
+                                .write_cdc_events(events)
+                                .await
+                                .map_err(PipelineError::Destination)?;
+                            current_lsn = last_lsn;
+                            info!("sending status update with lsn: {last_lsn}");
+                            let inner = unsafe {
+                                batch_timeout_stream
+                                    .as_mut()
+                                    .get_unchecked_mut()
+                                    .get_inner_mut()
+                            };
+                            inner
                                 .as_mut()
-                                .get_unchecked_mut()
-                                .get_inner_mut()
-                        };
-                        inner
-                            .as_mut()
-                            .send_status_update(last_lsn)
-                            .await
-                            .map_err(CommonSourceError::StatusUpdate)?;
+                                .send_status_update(last_lsn)
+                                .await
+                                .map_err(CommonSourceError::StatusUpdate)?;
+                        }
+                        None => {
+                            info!("CDC stream unexpected error");
+                            return Err(PipelineError::CommonSource(
+                                CommonSourceError::CdcStream(
+                                    CdcStreamError::CdcEventConversion(
+                                        CdcEventConversionError::UnknownReplicationMessage
+                                    )
+                                )
+                            ));
+                        }
                     }
                 }
                 _ = ping_interval.tick() => {
