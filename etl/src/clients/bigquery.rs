@@ -3,6 +3,7 @@ use std::{collections::HashSet, fs};
 use bytes::{Buf, BufMut};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use futures::StreamExt;
+use gcp_bigquery_client::error::NestedResponseError;
 use gcp_bigquery_client::model::table::Table;
 use gcp_bigquery_client::storage::{ColumnMode, StorageApi};
 use gcp_bigquery_client::yup_oauth2::parse_service_account_key;
@@ -648,18 +649,30 @@ impl BigQueryClient {
             .query(&self.project_id, QueryRequest::new(query))
             .await?;
 
-        // Print cost information
+        // Check if query completed
+        if !query_response.job_complete.unwrap_or(false) {
+            return Err(BQError::ResponseError {
+                error: gcp_bigquery_client::error::ResponseError {
+                    error: NestedResponseError {
+                        code: 0,
+                        message: "Query did not complete".to_string(),
+                        status: "INCOMPLETE".to_string(),
+                        errors: vec![],
+                    },
+                },
+            });
+        }
+
+        // Log cost information
         if let Some(bytes_str) = &query_response.total_bytes_processed {
             if let Ok(bytes_processed) = bytes_str.parse::<u64>() {
-                let cost_usd = (bytes_processed as f64 / 1_000_000_000_000.0) * 6.25; // $6.25 per TB
+                let cost_usd = (bytes_processed as f64 / 1_000_000_000_000.0) * 6.25;
                 info!(
                     "Query processed {:.0} MB, estimated cost: ${:.4}",
                     bytes_processed as f64 / 1_000_000.0,
                     cost_usd
                 );
             }
-        } else {
-            info!("Query response: {:?}", query_response);
         }
 
         Ok(ResultSet::new_from_query_response(query_response))

@@ -105,6 +105,6 @@ until [ "$(psql -U "$POSTGRES_USER" -tAc "SHOW wal_level;")" = "logical" ]; do
   sleep 2
 done
 
-psql -U "$POSTGRES_USER" -tAc "create publication my_publication for table table1, table2, all_postgres_types;"
+psql -U "$POSTGRES_USER" -tAc "create publication bqpub for table table1, table2, all_postgres_types;"
 
 echo "Init script finished."
