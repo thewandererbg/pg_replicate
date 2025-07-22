@@ -49,16 +49,19 @@ impl CdcEventConverter {
         let mut values = Vec::with_capacity(column_schemas.len());
 
         for (i, column_schema) in column_schemas.iter().enumerate() {
-            let cell = match &tuple_data[i] {
-                TupleData::Null => Cell::Null,
-                TupleData::UnchangedToast => TextFormatConverter::default_value(&column_schema.typ),
-                TupleData::Binary(_) => {
+            let cell = match tuple_data.get(i) {
+                Some(TupleData::Null) => Cell::Null,
+                Some(TupleData::UnchangedToast) => {
+                    TextFormatConverter::default_value(&column_schema.typ)
+                }
+                Some(TupleData::Binary(_)) => {
                     return Err(CdcEventConversionError::BinaryFormatNotSupported)
                 }
-                TupleData::Text(bytes) => {
+                Some(TupleData::Text(bytes)) => {
                     let str = str::from_utf8(&bytes[..])?;
                     TextFormatConverter::try_from_str(&column_schema.typ, str)?
                 }
+                None => Cell::Null,
             };
             values.push(cell);
         }
