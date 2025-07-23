@@ -3,7 +3,7 @@ source:
   port: 5432
   name: "postgres"
   username: "postgres"
-  password: "password"
+  password: "postgres"
   slot_name: "stdout_slot"
   tls:
     trusted_root_certs: ""

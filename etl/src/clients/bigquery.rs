@@ -27,6 +27,7 @@ use crate::conversions::numeric::PgNumeric;
 use crate::conversions::table_row::TableRow;
 use crate::conversions::{ArrayCell, Cell};
 
+#[derive(Clone)]
 pub struct BigQueryClient {
     project_id: String,
     client: Client,

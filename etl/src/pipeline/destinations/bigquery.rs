@@ -1,3 +1,5 @@
+use futures::future::join_all;
+use gcp_bigquery_client::storage::TableDescriptor;
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
@@ -308,20 +310,61 @@ impl BatchDestination for BigQueryBatchDestination {
             }
         }
 
-        for (table_id, table_rows) in table_name_to_table_rows {
-            let table_schema = self.get_table_schema(table_id)?;
-            let table_name = Self::table_name_in_bq(&table_schema.name);
-            let table_descriptor = table_schema_to_descriptor(table_schema);
+        // for (table_id, table_rows) in table_name_to_table_rows {
+        //     let table_schema = self.get_table_schema(table_id)?;
+        //     let table_name = Self::table_name_in_bq(&table_schema.name);
+        //     let table_descriptor = table_schema_to_descriptor(table_schema);
 
-            self.client
-                .upsert_rows(
-                    &self.dataset_id,
-                    &table_name,
-                    &table_descriptor,
-                    &table_rows,
+        //     self.client
+        //         .upsert_rows(
+        //             &self.dataset_id,
+        //             &table_name,
+        //             &table_descriptor,
+        //             &table_rows,
+        //         )
+        //         .await?;
+        // }
+
+        // Gather all the preparation data first
+        let prepared_data: Result<
+            Vec<(String, TableDescriptor, Vec<TableRow>)>,
+            BigQueryDestinationError,
+        > =
+            table_name_to_table_rows
+                .into_iter()
+                .map(
+                    |(table_id, table_rows)| -> Result<
+                        (String, TableDescriptor, Vec<TableRow>),
+                        BigQueryDestinationError,
+                    > {
+                        let table_schema = self.get_table_schema(table_id)?;
+                        let table_name = Self::table_name_in_bq(&table_schema.name);
+                        let table_descriptor = table_schema_to_descriptor(table_schema);
+                        Ok((table_name, table_descriptor, table_rows))
+                    },
                 )
-                .await?;
-        }
+                .collect();
+
+        let prepared_data = prepared_data?;
+
+        // Now run all upsert operations concurrently
+        let tasks: Vec<_> = prepared_data
+            .into_iter()
+            .map(|(table_name, table_descriptor, table_rows)| {
+                let dataset_id = self.dataset_id.clone();
+                let mut client = self.client.clone();
+                async move {
+                    client
+                        .upsert_rows(&dataset_id, &table_name, &table_descriptor, &table_rows)
+                        .await
+                }
+            })
+            .collect();
+
+        join_all(tasks)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
 
         if new_last_lsn != PgLsn::from(0) {
             self.client
