@@ -4,28 +4,26 @@ version = "0.1.0"
 edition = "2024"
 autotests = false
 
-[[test]]
-name = "integration"
-path = "tests/integration/mod.rs"
-required-features = ["test-utils"]
-
-[[test]]
-name = "failpoints"
-path = "tests/failpoints/mod.rs"
-required-features = ["failpoints", "test-utils"]
+[features]
+unknown-types-to-bytes = []
+test-utils = ["postgres/test-utils"]
+failpoints = ["fail/failpoints"]
+default = ["unknown-types-to-bytes"]
 
 [dependencies]
 config = { workspace = true }
 postgres = { workspace = true, features = ["tokio", "replication"] }
 
-bytes = { workspace = true }
 byteorder = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
+const-oid = { workspace = true, default-features = false }
 fail = { workspace = true }
 futures = { workspace = true }
 pg_escape = { workspace = true }
 pin-project-lite = { workspace = true }
 postgres-replication = { workspace = true }
+ring = { workspace = true, default-features = false }
 rustls = { workspace = true, features = ["aws-lc-rs", "logging"] }
 rustls-pemfile = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }
@@ -37,10 +35,10 @@ tokio-postgres = { workspace = true, features = [
     "with-uuid-1",
     "with-serde_json-1",
 ] }
-tokio-postgres-rustls = { workspace = true }
-tokio-util = { workspace = true, features = ["time"] }
+tokio-rustls = { workspace = true, default-features = false }
 tracing = { workspace = true, default-features = true }
 uuid = { workspace = true, features = ["v4"] }
+x509-cert = { workspace = true, default-features = false }
 
 [dev-dependencies]
 postgres = { workspace = true, features = ["test-utils", "tokio"] }
@@ -48,9 +46,12 @@ telemetry = { workspace = true }
 
 rand = { workspace = true, features = ["thread_rng"] }
 
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+required-features = ["test-utils"]
 
-[features]
-unknown-types-to-bytes = []
-test-utils = ["postgres/test-utils"]
-failpoints = ["fail/failpoints"]
-default = ["unknown-types-to-bytes"]
+[[test]]
+name = "failpoints"
+path = "tests/failpoints/mod.rs"
+required-features = ["failpoints", "test-utils"]
