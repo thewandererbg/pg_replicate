@@ -5,12 +5,13 @@ use tracing::{error, info};
 
 use crate::bail;
 use crate::concurrency::shutdown::{ShutdownTx, create_shutdown_channel};
-use crate::destination::base::Destination;
+use crate::destination::Destination;
 use crate::error::{ErrorKind, EtlError, EtlResult};
 use crate::replication::client::PgReplicationClient;
-use crate::schema::cache::SchemaCache;
-use crate::state::store::base::StateStore;
+use crate::schema::SchemaCache;
+use crate::state::store::StateStore;
 use crate::state::table::TableReplicationPhase;
+use crate::types::PipelineId;
 use crate::workers::apply::{ApplyWorker, ApplyWorkerHandle};
 use crate::workers::base::{Worker, WorkerHandle};
 use crate::workers::pool::TableSyncWorkerPool;
@@ -25,8 +26,6 @@ enum PipelineWorkers {
         pool: TableSyncWorkerPool,
     },
 }
-
-pub type PipelineId = u64;
 
 #[derive(Debug)]
 pub struct Pipeline<S, D> {
