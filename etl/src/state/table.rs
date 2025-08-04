@@ -11,7 +11,6 @@ use crate::error::{ErrorKind, EtlError};
 /// Contains diagnostic information including the table that failed, the reason for failure,
 /// an optional solution suggestion, and the retry policy to apply.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct TableReplicationError {
     table_id: TableId,
     reason: String,
@@ -132,7 +131,7 @@ impl TableReplicationError {
 }
 
 /// Defines the retry strategy for a failed table replication.
-#[derive(Debug)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum RetryPolicy {
     /// No retry should be attempted, the system has to be fixed by hand.
     NoRetry,
@@ -150,7 +149,7 @@ impl RetryPolicy {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum TableReplicationPhase {
     /// Set by the pipeline when it first starts and encounters a table for the first time
     Init,
@@ -188,11 +187,16 @@ pub enum TableReplicationPhase {
     /// be applied by the apply worker only
     Ready,
 
-    /// Set by either the table-sync worker or the apply worker when a table is no
-    /// longer being synced because of an error. Tables in this state can only
-    /// start syncing again after a manual intervention from the user.
-    // TODO: turn this into a generic `Error` state with more information.
-    Skipped,
+    /// Set by either the table-sync worker or the apply worker when a table encounters
+    /// an error during replication. Contains diagnostic information and retry policy.
+    Errored {
+        /// Human-readable description of what went wrong
+        reason: String,
+        /// Optional suggestion for how to fix the issue
+        solution: Option<String>,
+        /// Retry policy specifying how/when to retry
+        retry_policy: RetryPolicy,
+    },
 }
 
 impl TableReplicationPhase {
@@ -202,10 +206,12 @@ impl TableReplicationPhase {
 }
 
 impl From<TableReplicationError> for TableReplicationPhase {
-    fn from(_value: TableReplicationError) -> Self {
-        // TODO: implement actual conversion with proper values once `Skipped` is converted to `Errored`
-        //  and the fields are added.
-        Self::Skipped
+    fn from(value: TableReplicationError) -> Self {
+        Self::Errored {
+            reason: value.reason,
+            solution: value.solution,
+            retry_policy: value.retry_policy,
+        }
     }
 }
 
@@ -218,7 +224,7 @@ pub enum TableReplicationPhaseType {
     Catchup,
     SyncDone,
     Ready,
-    Skipped,
+    Errored,
 }
 
 impl TableReplicationPhaseType {
@@ -232,7 +238,7 @@ impl TableReplicationPhaseType {
             Self::Catchup => false,
             Self::SyncDone => true,
             Self::Ready => true,
-            Self::Skipped => true,
+            Self::Errored => true,
         }
     }
 
@@ -249,7 +255,7 @@ impl TableReplicationPhaseType {
             Self::Catchup => false,
             Self::SyncDone => false,
             Self::Ready => true,
-            Self::Skipped => true,
+            Self::Errored => true,
         }
     }
 }
@@ -264,7 +270,7 @@ impl<'a> From<&'a TableReplicationPhase> for TableReplicationPhaseType {
             TableReplicationPhase::Catchup { .. } => Self::Catchup,
             TableReplicationPhase::SyncDone { .. } => Self::SyncDone,
             TableReplicationPhase::Ready => Self::Ready,
-            TableReplicationPhase::Skipped => Self::Skipped,
+            TableReplicationPhase::Errored { .. } => Self::Errored,
         }
     }
 }
@@ -279,7 +285,7 @@ impl fmt::Display for TableReplicationPhaseType {
             Self::Catchup => write!(f, "catchup"),
             Self::SyncDone => write!(f, "sync_done"),
             Self::Ready => write!(f, "ready"),
-            Self::Skipped => write!(f, "skipped"),
+            Self::Errored => write!(f, "errored"),
         }
     }
 }

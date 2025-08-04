@@ -65,7 +65,7 @@ impl TableSyncWorkerStateInner {
         phase: TableReplicationPhase,
         state_store: &S,
     ) -> EtlResult<()> {
-        self.set(phase);
+        self.set(phase.clone());
 
         // If we should store this phase change, we want to do it via the supplied state store.
         if phase.as_type().should_store() {
@@ -82,8 +82,18 @@ impl TableSyncWorkerStateInner {
         Ok(())
     }
 
+    pub async fn rollback<S: StateStore>(&mut self, state_store: &S) -> EtlResult<()> {
+        // We rollback the state in the store and then also set the rolled back state in memory.
+        let previous_phase = state_store
+            .rollback_table_replication_state(self.table_id)
+            .await?;
+        self.set(previous_phase);
+
+        Ok(())
+    }
+
     pub fn replication_phase(&self) -> TableReplicationPhase {
-        self.table_replication_phase
+        self.table_replication_phase.clone()
     }
 }
 
@@ -338,51 +348,73 @@ where
                     // Convert error to table replication error to determine retry policy
                     let table_error =
                         TableReplicationError::from_etl_error(&config, table_id, &err);
+                    let retry_policy = table_error.retry_policy().clone();
 
-                    match table_error.retry_policy() {
+                    // We lock both the pool and the table sync worker state to be consistent
+                    let mut pool_guard = pool.lock().await;
+                    let mut state_guard = state.lock().await;
+
+                    // Update the state and store with the error
+                    if let Err(err) = state_guard
+                        .set_and_store(table_error.into(), &state_store)
+                        .await
+                    {
+                        error!(
+                            "failed to update table sync worker state for table {}: {}",
+                            table_id, err
+                        );
+
+                        pool_guard.mark_worker_finished(table_id);
+
+                        return Err(err);
+                    };
+
+                    match retry_policy {
                         RetryPolicy::TimedRetry { next_retry } => {
-                            // Calculate how long to sleep
                             let now = Utc::now();
-                            if now < *next_retry {
-                                let sleep_duration = (*next_retry - now)
+                            if now < next_retry {
+                                let sleep_duration = (next_retry - now)
                                     .to_std()
                                     .unwrap_or(Duration::from_secs(0));
+
                                 info!(
                                     "retrying table sync worker for table {} in {:?}",
                                     table_id, sleep_duration
                                 );
+
+                                // We drop the lock on the pool while waiting. We do not do the same
+                                // for the state guard since we want to hold the lock for that state
+                                // since when we are waiting to retry, nobody should be allowed to
+                                // modify it.
+                                drop(pool_guard);
+
                                 tokio::time::sleep(sleep_duration).await;
-                                // Continue the loop to retry
-                                continue;
                             } else {
-                                // Retry time has already passed, retry immediately
                                 info!(
                                     "retrying table sync worker for table {} immediately",
                                     table_id
                                 );
-                                continue;
                             }
-                        }
-                        RetryPolicy::NoRetry | RetryPolicy::ManualRetry => {
-                            // Exit the worker and mark as finished
-                            let mut pool = pool.lock().await;
-                            pool.mark_worker_finished(table_id);
 
-                            // Update the state store
-                            let table_replication_phase = table_error.into();
-                            if let Err(err) = TableSyncWorkerState::set_and_store(
-                                &pool,
-                                &state_store,
-                                table_id,
-                                table_replication_phase,
-                            )
-                            .await
-                            {
+                            // Before rolling back, we acquire the pool lock again for consistency
+                            let mut pool_guard = pool.lock().await;
+
+                            // After sleeping, we rollback to the previous state and retry
+                            if let Err(err) = state_guard.rollback(&state_store).await {
                                 error!(
-                                    "failed to store error state for table {} during error: {}",
+                                    "failed to rollback table sync worker state for table {}: {}",
                                     table_id, err
                                 );
-                            }
+
+                                pool_guard.mark_worker_finished(table_id);
+
+                                return Err(err);
+                            };
+
+                            continue;
+                        }
+                        RetryPolicy::NoRetry | RetryPolicy::ManualRetry => {
+                            pool_guard.mark_worker_finished(table_id);
 
                             return Err(err);
                         }
@@ -669,12 +701,12 @@ where
         _remote_final_lsn: PgLsn,
     ) -> EtlResult<bool> {
         let inner = self.table_sync_worker_state.lock().await;
-        let is_skipped = matches!(
+        let is_errored = matches!(
             inner.table_replication_phase.as_type(),
-            TableReplicationPhaseType::Skipped
+            TableReplicationPhaseType::Errored
         );
 
-        let should_apply_changes = !is_skipped && self.table_id == table_id;
+        let should_apply_changes = !is_errored && self.table_id == table_id;
 
         Ok(should_apply_changes)
     }

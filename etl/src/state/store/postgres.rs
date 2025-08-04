@@ -3,35 +3,51 @@ use std::{collections::HashMap, sync::Arc};
 use config::shared::PgConnectionConfig;
 use postgres::replication::{
     TableReplicationState, TableReplicationStateRow, connect_to_source_database,
-    get_table_replication_state_rows, update_replication_state,
+    get_table_replication_state_rows, rollback_replication_state, update_replication_state,
 };
 use postgres::schema::TableId;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
-use tokio_postgres::types::PgLsn;
 use tracing::{debug, info};
 
 use crate::error::{ErrorKind, EtlError, EtlResult};
 use crate::state::store::StateStore;
-use crate::state::table::TableReplicationPhase;
+use crate::state::table::{RetryPolicy, TableReplicationPhase};
 use crate::types::PipelineId;
 use crate::{bail, etl_error};
 
 const NUM_POOL_CONNECTIONS: u32 = 1;
 
-impl TryFrom<TableReplicationPhase> for (TableReplicationState, Option<String>) {
+impl TryFrom<TableReplicationPhase> for TableReplicationState {
     type Error = EtlError;
 
     fn try_from(value: TableReplicationPhase) -> Result<Self, Self::Error> {
-        Ok(match value {
-            TableReplicationPhase::Init => (TableReplicationState::Init, None),
-            TableReplicationPhase::DataSync => (TableReplicationState::DataSync, None),
-            TableReplicationPhase::FinishedCopy => (TableReplicationState::FinishedCopy, None),
-            TableReplicationPhase::SyncDone { lsn } => {
-                (TableReplicationState::SyncDone, Some(lsn.to_string()))
+        match value {
+            TableReplicationPhase::Init => Ok(TableReplicationState::Init),
+            TableReplicationPhase::DataSync => Ok(TableReplicationState::DataSync),
+            TableReplicationPhase::FinishedCopy => Ok(TableReplicationState::FinishedCopy),
+            TableReplicationPhase::SyncDone { lsn } => Ok(TableReplicationState::SyncDone { lsn }),
+            TableReplicationPhase::Ready => Ok(TableReplicationState::Ready),
+            TableReplicationPhase::Errored {
+                reason,
+                solution,
+                retry_policy,
+            } => {
+                // Convert ETL RetryPolicy to postgres RetryPolicy
+                let db_retry_policy = match retry_policy {
+                    RetryPolicy::NoRetry => postgres::replication::RetryPolicy::NoRetry,
+                    RetryPolicy::ManualRetry => postgres::replication::RetryPolicy::ManualRetry,
+                    RetryPolicy::TimedRetry { next_retry } => {
+                        postgres::replication::RetryPolicy::TimedRetry { next_retry }
+                    }
+                };
+
+                Ok(TableReplicationState::Errored {
+                    reason,
+                    solution,
+                    retry_policy: db_retry_policy,
+                })
             }
-            TableReplicationPhase::Ready => (TableReplicationState::Ready, None),
-            TableReplicationPhase::Skipped => (TableReplicationState::Skipped, None),
             TableReplicationPhase::SyncWait | TableReplicationPhase::Catchup { .. } => {
                 bail!(
                     ErrorKind::InvalidState,
@@ -39,7 +55,61 @@ impl TryFrom<TableReplicationPhase> for (TableReplicationState, Option<String>) 
                     "In-memory table replication phase can't be saved in the state store"
                 );
             }
-        })
+        }
+    }
+}
+
+impl TryFrom<TableReplicationStateRow> for TableReplicationPhase {
+    type Error = EtlError;
+
+    fn try_from(value: TableReplicationStateRow) -> Result<Self, Self::Error> {
+        // Parse the metadata field from the row, which contains all the data we need to build the
+        // replication phase
+        let Some(table_replication_state) = value.deserialize_metadata().map_err(|err| {
+            etl_error!(
+                ErrorKind::DeserializationError,
+                "Failed to deserialize table replication state",
+                format!(
+                    "Failed to deserialize table replication state from metadata column in Postgres: {err}"
+                )
+            )
+        })?
+        else {
+            bail!(
+                ErrorKind::InvalidState,
+                "The table replication state does not exist",
+                "The table replication state does not exist in the metadata column in Postgres"
+            );
+        };
+
+        // Convert postgres state to phase (they are the same structs but one is meant to represent
+        // only the state which can be saved in the db).
+        match table_replication_state {
+            TableReplicationState::Init => Ok(TableReplicationPhase::Init),
+            TableReplicationState::DataSync => Ok(TableReplicationPhase::DataSync),
+            TableReplicationState::FinishedCopy => Ok(TableReplicationPhase::FinishedCopy),
+            TableReplicationState::SyncDone { lsn } => Ok(TableReplicationPhase::SyncDone { lsn }),
+            TableReplicationState::Ready => Ok(TableReplicationPhase::Ready),
+            TableReplicationState::Errored {
+                reason,
+                solution,
+                retry_policy,
+            } => {
+                let etl_retry_policy = match retry_policy {
+                    postgres::replication::RetryPolicy::NoRetry => RetryPolicy::NoRetry,
+                    postgres::replication::RetryPolicy::ManualRetry => RetryPolicy::ManualRetry,
+                    postgres::replication::RetryPolicy::TimedRetry { next_retry } => {
+                        RetryPolicy::TimedRetry { next_retry }
+                    }
+                };
+
+                Ok(TableReplicationPhase::Errored {
+                    reason,
+                    solution,
+                    retry_policy: etl_retry_policy,
+                })
+            }
+        }
     }
 }
 
@@ -71,6 +141,10 @@ impl PostgresStateStore {
     }
 
     async fn connect_to_source(&self) -> Result<PgPool, sqlx::Error> {
+        // We connect to source database each time we update because we assume that
+        // these updates will be infrequent. It has some overhead to establish a
+        // connection, but it's better than holding a connection open for long periods
+        // when there's little activity on it.
         let pool = connect_to_source_database(
             &self.source_config,
             NUM_POOL_CONNECTIONS,
@@ -79,63 +153,6 @@ impl PostgresStateStore {
         .await?;
 
         Ok(pool)
-    }
-
-    async fn get_all_replication_state_rows(
-        &self,
-        pool: &PgPool,
-        pipeline_id: PipelineId,
-    ) -> sqlx::Result<Vec<TableReplicationStateRow>> {
-        get_table_replication_state_rows(pool, pipeline_id as i64).await
-    }
-
-    async fn update_replication_state(
-        &self,
-        pipeline_id: PipelineId,
-        table_id: TableId,
-        state: TableReplicationState,
-        sync_done_lsn: Option<String>,
-    ) -> sqlx::Result<()> {
-        // We connect to source database each time we update because we assume that
-        // these updates will be infrequent. It has some overhead to establish a
-        // connection, but it's better than holding a connection open for long periods
-        // when there's little activity on it.
-        let pool = self.connect_to_source().await?;
-        update_replication_state(&pool, pipeline_id, table_id, state, sync_done_lsn).await
-    }
-
-    async fn replication_phase_from_state(
-        &self,
-        state: &TableReplicationState,
-        sync_done_lsn: Option<String>,
-    ) -> EtlResult<TableReplicationPhase> {
-        Ok(match state {
-            TableReplicationState::Init => TableReplicationPhase::Init,
-            TableReplicationState::DataSync => TableReplicationPhase::DataSync,
-            TableReplicationState::FinishedCopy => TableReplicationPhase::FinishedCopy,
-            TableReplicationState::SyncDone => match sync_done_lsn {
-                Some(lsn_str) => {
-                    let lsn = lsn_str.parse::<PgLsn>().map_err(|_| {
-                        etl_error!(
-                            ErrorKind::ValidationError,
-                            "Invalid LSN",
-                            format!(
-                                "Invalid confirmed flush lsn value in state store: {}",
-                                lsn_str
-                            )
-                        )
-                    })?;
-                    TableReplicationPhase::SyncDone { lsn }
-                }
-                None => bail!(
-                    ErrorKind::ValidationError,
-                    "Missing LSN",
-                    "Lsn can't be missing from the state store if state is 'SyncDone'"
-                ),
-            },
-            TableReplicationState::Ready => TableReplicationPhase::Ready,
-            TableReplicationState::Skipped => TableReplicationPhase::Skipped,
-        })
     }
 }
 
@@ -159,16 +176,18 @@ impl StateStore for PostgresStateStore {
         debug!("loading table replication states from postgres state store");
 
         let pool = self.connect_to_source().await?;
-        let replication_state_rows = self
-            .get_all_replication_state_rows(&pool, self.pipeline_id)
-            .await?;
+        let replication_state_rows =
+            get_table_replication_state_rows(&pool, self.pipeline_id as i64).await?;
+
         let mut table_states: HashMap<TableId, TableReplicationPhase> = HashMap::new();
         for row in replication_state_rows {
-            let phase = self
-                .replication_phase_from_state(&row.state, row.sync_done_lsn)
-                .await?;
-            table_states.insert(TableId::new(row.table_id.0), phase);
+            let table_id = TableId::new(row.table_id.0);
+            let phase: TableReplicationPhase = row.try_into()?;
+            table_states.insert(table_id, phase);
         }
+
+        // For performance reasons, since we load the replication states only once during startup
+        // and from a single thread, we can afford to have a super short critical section.
         let mut inner = self.inner.lock().await;
         inner.table_states = table_states.clone();
 
@@ -185,11 +204,15 @@ impl StateStore for PostgresStateStore {
         table_id: TableId,
         state: TableReplicationPhase,
     ) -> EtlResult<()> {
-        let (table_state, sync_done_lsn) = state.try_into()?;
-        self.update_replication_state(self.pipeline_id, table_id, table_state, sync_done_lsn)
-            .await?;
+        let db_state: TableReplicationState = state.clone().try_into()?;
 
+        let pool = self.connect_to_source().await?;
+
+        // We lock the inner state before updating the state in the database, to make sure we are
+        // consistent. If we were to lock the states only after the db state is modified, we might
+        // be inconsistent since there are some interleaved executions that lead to a wrong state.
         let mut inner = self.inner.lock().await;
+        update_replication_state(&pool, self.pipeline_id as i64, table_id, db_state).await?;
         inner.table_states.insert(table_id, state);
 
         Ok(())
@@ -197,12 +220,24 @@ impl StateStore for PostgresStateStore {
 
     async fn rollback_table_replication_state(
         &self,
-        _table_id: TableId,
+        table_id: TableId,
     ) -> EtlResult<TableReplicationPhase> {
-        // TODO: implement rollback for Postgres.
-        Err(etl_error!(
-            ErrorKind::StateRollbackError,
-            "There is no state in Postgres to rollback to"
-        ))
+        let pool = self.connect_to_source().await?;
+
+        // Here we perform locking for the same reasons stated in `update_table_replication_state`.
+        let mut inner = self.inner.lock().await;
+        match rollback_replication_state(&pool, self.pipeline_id, table_id).await? {
+            Some(restored_row) => {
+                let restored_phase: TableReplicationPhase = restored_row.try_into()?;
+                inner.table_states.insert(table_id, restored_phase.clone());
+
+                Ok(restored_phase)
+            }
+            None => Err(etl_error!(
+                ErrorKind::StateRollbackError,
+                "No previous state found",
+                "There is no previous state to rollback to for this table"
+            )),
+        }
     }
 }

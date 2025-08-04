@@ -19,6 +19,7 @@ use crate::replication::slot::get_slot_name;
 use crate::replication::stream::TableCopyStream;
 use crate::schema::SchemaCache;
 use crate::state::store::StateStore;
+use crate::state::table::RetryPolicy;
 use crate::state::table::{TableReplicationPhase, TableReplicationPhaseType};
 use crate::types::PipelineId;
 use crate::workers::base::WorkerType;
@@ -88,7 +89,7 @@ where
                 ErrorKind::InvalidState,
                 "Invalid replication phase",
                 format!(
-                    "Invalid replication phase '{}': expected Init, DataSync, or FinishedCopy",
+                    "Invalid replication phase '{:?}': expected 'Init', 'DataSync', or 'FinishedCopy'",
                     phase_type
                 )
             );
@@ -167,7 +168,16 @@ where
 
             if !table_schema.has_primary_keys() {
                 state_store
-                    .update_table_replication_state(table_id, TableReplicationPhase::Skipped)
+                    .update_table_replication_state(
+                        table_id,
+                        TableReplicationPhase::Errored {
+                            reason: "The table has no primary keys".to_string(),
+                            solution: Some(format!(
+                                "You should set at least one primary key on the table {table_id}"
+                            )),
+                            retry_policy: RetryPolicy::ManualRetry,
+                        },
+                    )
                     .await?;
 
                 bail!(
