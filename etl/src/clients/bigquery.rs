@@ -1486,7 +1486,7 @@ pub fn table_schema_to_descriptor(table_schema: &TableSchema) -> TableDescriptor
             | Type::JSON_ARRAY
             | Type::JSONB_ARRAY
             | Type::OID_ARRAY
-            | Type::BYTEA_ARRAY => ColumnMode::Repeated,
+            | Type::BYTEA_ARRAY => ColumnMode::Nullable,
             _ => ColumnMode::Nullable,
         };
 
