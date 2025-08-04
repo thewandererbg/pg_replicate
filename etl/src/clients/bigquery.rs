@@ -738,7 +738,7 @@ impl BigQueryClient {
         let partition_type = self.get_partition_type(&table_info);
         let partition_column = self.get_partition_column(&table_info);
 
-        let num_bytes = table_info
+        let num_bytes: u64 = table_info
             .num_bytes
             .unwrap_or("0".to_string())
             .parse()
