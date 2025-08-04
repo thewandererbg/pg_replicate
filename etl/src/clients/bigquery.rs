@@ -740,8 +740,8 @@ impl BigQueryClient {
 
         let num_bytes: u64 = table_info
             .num_bytes
-            .unwrap_or("0".to_string())
-            .parse()
+            .as_deref()
+            .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         let streaming_buffer = table_info.streaming_buffer.is_some();
 
@@ -749,13 +749,12 @@ impl BigQueryClient {
         info!("{} has streaming buffer: {}", base_table, streaming_buffer);
         info!("{} has partition column: {}", base_table, partition_column);
 
-        // 10MB is the minimum bytesbilled for any query.
-        // So we need to check if the table is large enough to use partition replacement
-        // Stream directly into table if it's small enough
+        // 40MB is the minimum bytes billed for any partition replacement.
+        // Stream directly into table if it's lower than 40MB
         if partition_type == "NONE"
             || partition_column == ""
             || streaming_buffer
-            || num_bytes < 20 * 1024 * 1024
+            || num_bytes < 40 * 1024 * 1024
         {
             info!("Streaming rows into {}", base_table);
             self.stream_rows(dataset_id, base_table, table_descriptor, update_rows)
@@ -835,14 +834,12 @@ impl BigQueryClient {
         affected_partitions: &[String],
     ) -> Result<(), BQError> {
         // 1. Create empty temp table with same schema as base table
+        self.create_temp_table(dataset_id, temp_table, base_table)
+            .await?;
+
         // 2. Copy existing data from unaffected partitions to temp table
-        self.create_temp_table_with_partition_data(
-            dataset_id,
-            temp_table,
-            base_table,
-            &affected_partitions,
-        )
-        .await?;
+        self.copy_existing_partitions(dataset_id, temp_table, base_table, &affected_partitions)
+            .await?;
 
         // 3. Add the new/updated records via streaming
         self.stream_rows(dataset_id, temp_table, table_descriptor, update_rows)
@@ -851,7 +848,22 @@ impl BigQueryClient {
         Ok(())
     }
 
-    async fn create_temp_table_with_partition_data(
+    async fn create_temp_table(
+        &mut self,
+        dataset_id: &str,
+        temp_table: &str,
+        base_table: &str,
+    ) -> Result<(), BQError> {
+        let query = format!(
+            "create table `{}.{}.{}` like `{}.{}.{}`",
+            self.project_id, dataset_id, temp_table, self.project_id, dataset_id, base_table
+        );
+
+        self.query(query).await?;
+        Ok(())
+    }
+
+    async fn copy_existing_partitions(
         &mut self,
         dataset_id: &str,
         temp_table: &str,
@@ -865,20 +877,7 @@ impl BigQueryClient {
             .join(",");
 
         let query = format!(
-            r#"
-             CREATE TABLE `{}.{}.{}`
-             LIKE `{}.{}.{}`;
-
-             INSERT INTO `{}.{}.{}`
-             SELECT * FROM `{}.{}.{}`
-             WHERE DATE(created_at) IN ({});
-             "#,
-            self.project_id,
-            dataset_id,
-            temp_table,
-            self.project_id,
-            dataset_id,
-            base_table,
+            "insert into `{}.{}.{}` select * from `{}.{}.{}` where date(created_at) in ({})",
             self.project_id,
             dataset_id,
             temp_table,
@@ -934,7 +933,7 @@ impl BigQueryClient {
         // Query partitions for delete rows if any exist
         if !delete_ids.is_empty() {
             let query = format!(
-                "SELECT DISTINCT FORMAT_DATE('%Y-%m-%d', {}) AS partition_date FROM `{}.{}.{}` WHERE id IN ({})",
+                "select distinct format_date('%Y-%m-%d', {}) as partition_date from `{}.{}.{}` where id in ({})",
                 partition_column, self.project_id, dataset_id, table_name, delete_ids.join(", ")
             );
 
@@ -966,13 +965,7 @@ impl BigQueryClient {
             .join(",");
 
         let merge_query = format!(
-            r#"
-                MERGE `{}.{}.{}` T
-                USING `{}.{}.{}` S
-                ON FALSE
-                WHEN NOT MATCHED BY SOURCE AND DATE(T.created_at) IN ({}) THEN DELETE
-                WHEN NOT MATCHED THEN INSERT ROW
-            "#,
+            "merge `{}.{}.{}` t using `{}.{}.{}` s on false when not matched by source and date(t.created_at) in ({}) then delete when not matched then insert row",
             self.project_id,
             dataset_id,
             base_table,
