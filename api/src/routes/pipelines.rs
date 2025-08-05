@@ -9,7 +9,7 @@ use config::shared::{
     ReplicatorConfig, SupabaseConfig, TlsConfig,
 };
 use postgres::replication::{
-    TableLookupError, TableReplicationState, TableReplicationStateType, get_table_name_from_oid,
+    TableLookupError, TableReplicationState, get_table_name_from_oid,
     get_table_replication_state_rows, reset_replication_state, rollback_replication_state,
 };
 use postgres::schema::TableId;
@@ -257,6 +257,7 @@ pub enum SimpleTableReplicationState {
     },
     Error {
         reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         solution: Option<String>,
         retry_policy: SimpleRetryPolicy,
     },
@@ -882,9 +883,10 @@ pub async fn rollback_table_state(
         .ok_or(PipelineError::MissingTableReplicationState)?;
 
     // Check if the current state is rollbackable (has ManualRetry policy)
-    let current_state = current_row.state_type();
-    let is_rollbackable = matches!(current_state, TableReplicationStateType::Errored);
-    if !is_rollbackable {
+    let current_state = current_row.deserialize_metadata().unwrap().unwrap();
+    // .map_err(PipelineError::InvalidTableReplicationState)?
+    // .ok_or(PipelineError::MissingTableReplicationState)?;
+    if !current_state.supports_manual_retry() {
         return Err(PipelineError::NotRollbackable(
             "Only manual retry errors can be rolled back".to_string(),
         ));
