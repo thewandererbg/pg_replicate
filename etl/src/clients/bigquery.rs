@@ -806,6 +806,7 @@ impl BigQueryClient {
             table_descriptor,
             update_rows,
             &affected_partitions,
+            partition_column,
         )
         .await?;
 
@@ -815,6 +816,7 @@ impl BigQueryClient {
             base_table,
             &temp_table,
             &affected_partitions,
+            partition_column,
         )
         .await?;
 
@@ -832,14 +834,21 @@ impl BigQueryClient {
         table_descriptor: &TableDescriptor,
         update_rows: &[TableRow],
         affected_partitions: &[String],
+        partition_column: &str,
     ) -> Result<(), BQError> {
         // 1. Create empty temp table with same schema as base table
         self.create_temp_table(dataset_id, temp_table, base_table)
             .await?;
 
         // 2. Copy existing data from unaffected partitions to temp table
-        self.copy_existing_partitions(dataset_id, temp_table, base_table, &affected_partitions)
-            .await?;
+        self.copy_existing_partitions(
+            dataset_id,
+            temp_table,
+            base_table,
+            &affected_partitions,
+            partition_column,
+        )
+        .await?;
 
         // 3. Add the new/updated records via streaming
         self.stream_rows(dataset_id, temp_table, table_descriptor, update_rows)
@@ -869,6 +878,7 @@ impl BigQueryClient {
         temp_table: &str,
         base_table: &str,
         affected_partitions: &[String],
+        partition_column: &str,
     ) -> Result<(), BQError> {
         let partition_filter = affected_partitions
             .iter()
@@ -877,13 +887,14 @@ impl BigQueryClient {
             .join(",");
 
         let query = format!(
-            "insert into `{}.{}.{}` select * from `{}.{}.{}` where date(created_at) in ({})",
+            "insert into `{}.{}.{}` select * from `{}.{}.{}` where date({}) in ({})",
             self.project_id,
             dataset_id,
             temp_table,
             self.project_id,
             dataset_id,
             base_table,
+            partition_column,
             partition_filter
         );
 
@@ -957,6 +968,7 @@ impl BigQueryClient {
         base_table: &str,
         temp_table: &str,
         affected_partitions: &[String],
+        partition_column: &str,
     ) -> Result<(), BQError> {
         let partition_filter = affected_partitions
             .iter()
@@ -965,13 +977,14 @@ impl BigQueryClient {
             .join(",");
 
         let merge_query = format!(
-            "merge `{}.{}.{}` t using `{}.{}.{}` s on false when not matched by source and date(t.created_at) in ({}) then delete when not matched then insert row",
+            "merge `{}.{}.{}` t using `{}.{}.{}` s on false when not matched by source and date(t.`{}`) in ({}) then delete when not matched then insert row",
             self.project_id,
             dataset_id,
             base_table,
             self.project_id,
             dataset_id,
             temp_table,
+            partition_column,
             partition_filter
         );
 
