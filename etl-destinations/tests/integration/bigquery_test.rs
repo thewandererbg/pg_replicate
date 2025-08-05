@@ -8,9 +8,9 @@ use etl::test_utils::test_destination_wrapper::TestDestinationWrapper;
 use etl::test_utils::test_schema::{TableSelection, insert_mock_data, setup_test_database_schema};
 use etl::types::{EventType, PgNumeric, PipelineId};
 use etl_destinations::bigquery::install_crypto_provider_for_bigquery;
+use etl_telemetry::init_test_tracing;
 use rand::random;
 use std::str::FromStr;
-use telemetry::init_test_tracing;
 
 use crate::common::bigquery::{
     BigQueryOrder, BigQueryUser, NonNullableColsScalar, NullableColsArray, NullableColsScalar,
@@ -20,6 +20,7 @@ use crate::common::bigquery::{
 #[tokio::test(flavor = "multi_thread")]
 async fn table_copy_and_streaming_with_restart() {
     init_test_tracing();
+
     install_crypto_provider_for_bigquery();
 
     let mut database = spawn_source_database().await;
