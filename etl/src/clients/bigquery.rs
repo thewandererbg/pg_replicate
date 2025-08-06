@@ -864,7 +864,11 @@ impl BigQueryClient {
         base_table: &str,
     ) -> Result<(), BQError> {
         let query = format!(
-            "create table `{}.{}.{}` like `{}.{}.{}`",
+            "create table `{}.{}.{}`
+             like `{}.{}.{}`
+             options(
+               expiration_timestamp=timestamp_add(current_timestamp(), interval 10 minute)
+             )",
             self.project_id, dataset_id, temp_table, self.project_id, dataset_id, base_table
         );
 
