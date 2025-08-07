@@ -1,4 +1,4 @@
-FROM rust:1.89.0-alpine AS builder
+FROM rust:1.88.0-alpine AS builder
 WORKDIR /app
 # Install build dependencies
 RUN apk add --no-cache clang musl-dev
