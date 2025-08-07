@@ -612,10 +612,13 @@ impl BigQueryClient {
 
     async fn query(&self, query: String) -> Result<ResultSet, BQError> {
         info!("Query: {}", query);
+        let mut query_request = QueryRequest::new(query);
+        query_request.timeout_ms = Some(300000); // 5 minutes
+
         let query_response = self
             .client
             .job()
-            .query(&self.project_id, QueryRequest::new(query))
+            .query(&self.project_id, query_request)
             .await?;
 
         // Check if query completed
