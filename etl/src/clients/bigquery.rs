@@ -118,52 +118,25 @@ impl BigQueryClient {
             &Type::JSON | &Type::JSONB => "json",
             &Type::OID => "int64",
             &Type::BYTEA => "bytes",
-            &Type::BOOL_ARRAY => "array<bool>",
-            &Type::CHAR_ARRAY
-            | &Type::BPCHAR_ARRAY
-            | &Type::VARCHAR_ARRAY
-            | &Type::NAME_ARRAY
-            | &Type::TEXT_ARRAY => "array<string>",
-            &Type::INT2_ARRAY | &Type::INT4_ARRAY | &Type::INT8_ARRAY => "array<int64>",
-            &Type::FLOAT4_ARRAY | &Type::FLOAT8_ARRAY => "array<float64>",
-            &Type::NUMERIC_ARRAY => "array<float64>",
-            &Type::DATE_ARRAY => "array<date>",
-            &Type::TIME_ARRAY => "array<time>",
-            &Type::TIMESTAMP_ARRAY | &Type::TIMESTAMPTZ_ARRAY => "array<timestamp>",
-            &Type::UUID_ARRAY => "array<string>",
-            &Type::JSON_ARRAY | &Type::JSONB_ARRAY => "array<json>",
-            &Type::OID_ARRAY => "array<int64>",
-            &Type::BYTEA_ARRAY => "array<bytes>",
+            // &Type::BOOL_ARRAY => "array<bool>",
+            // &Type::CHAR_ARRAY
+            // | &Type::BPCHAR_ARRAY
+            // | &Type::VARCHAR_ARRAY
+            // | &Type::NAME_ARRAY
+            // | &Type::TEXT_ARRAY => "array<string>",
+            // &Type::INT2_ARRAY | &Type::INT4_ARRAY | &Type::INT8_ARRAY => "array<int64>",
+            // &Type::FLOAT4_ARRAY | &Type::FLOAT8_ARRAY => "array<float64>",
+            // &Type::NUMERIC_ARRAY => "array<float64>",
+            // &Type::DATE_ARRAY => "array<date>",
+            // &Type::TIME_ARRAY => "array<time>",
+            // &Type::TIMESTAMP_ARRAY | &Type::TIMESTAMPTZ_ARRAY => "array<timestamp>",
+            // &Type::UUID_ARRAY => "array<string>",
+            // &Type::JSON_ARRAY | &Type::JSONB_ARRAY => "array<json>",
+            // &Type::OID_ARRAY => "array<int64>",
+            // &Type::BYTEA_ARRAY => "array<bytes>",
             _ => "string",
         }
     }
-
-    // fn is_array_type(typ: &Type) -> bool {
-    //     matches!(
-    //         typ,
-    //         &Type::BOOL_ARRAY
-    //             | &Type::CHAR_ARRAY
-    //             | &Type::BPCHAR_ARRAY
-    //             | &Type::VARCHAR_ARRAY
-    //             | &Type::NAME_ARRAY
-    //             | &Type::TEXT_ARRAY
-    //             | &Type::INT2_ARRAY
-    //             | &Type::INT4_ARRAY
-    //             | &Type::INT8_ARRAY
-    //             | &Type::FLOAT4_ARRAY
-    //             | &Type::FLOAT8_ARRAY
-    //             | &Type::NUMERIC_ARRAY
-    //             | &Type::DATE_ARRAY
-    //             | &Type::TIME_ARRAY
-    //             | &Type::TIMESTAMP_ARRAY
-    //             | &Type::TIMESTAMPTZ_ARRAY
-    //             | &Type::UUID_ARRAY
-    //             | &Type::JSON_ARRAY
-    //             | &Type::JSONB_ARRAY
-    //             | &Type::OID_ARRAY
-    //             | &Type::BYTEA_ARRAY
-    //     )
-    // }
 
     fn column_spec(column_schema: &ColumnSchema, s: &mut String) {
         s.push('`');
@@ -172,9 +145,6 @@ impl BigQueryClient {
         s.push(' ');
         let typ = Self::postgres_to_bigquery_type(&column_schema.typ);
         s.push_str(typ);
-        // if !column_schema.nullable && !Self::is_array_type(&column_schema.typ) {
-        //     s.push_str(" not null");
-        // };
         if !column_schema.nullable {
             s.push_str(" not null");
         };
@@ -602,7 +572,6 @@ impl BigQueryClient {
 
     pub async fn drop_table(&self, dataset_id: &str, table_name: &str) -> Result<(), BQError> {
         let project_id = &self.project_id;
-        info!("dropping table {project_id}.{dataset_id}.{table_name} in bigquery");
         let query = format!("drop table `{project_id}.{dataset_id}.{table_name}`",);
 
         let _ = self.query(query).await?;
@@ -612,7 +581,6 @@ impl BigQueryClient {
 
     pub async fn truncate_table(&self, dataset_id: &str, table_name: &str) -> Result<(), BQError> {
         let project_id = &self.project_id;
-        info!("truncating table {project_id}.{dataset_id}.{table_name} in BigQuery");
         let query = format!("truncate table `{project_id}.{dataset_id}.{table_name}`");
 
         let _ = self.query(query).await?;
@@ -820,8 +788,9 @@ impl BigQueryClient {
         )
         .await?;
 
-        // 3. Cleanup
-        self.drop_table(dataset_id, &temp_table).await?;
+        // 3. Cleanup.
+        // Ignore failed because we already have ttl for temp table
+        let _ = self.drop_table(dataset_id, &temp_table).await;
 
         Ok(())
     }
@@ -864,11 +833,7 @@ impl BigQueryClient {
         base_table: &str,
     ) -> Result<(), BQError> {
         let query = format!(
-            "create table `{}.{}.{}`
-             like `{}.{}.{}`
-             options(
-               expiration_timestamp=timestamp_add(current_timestamp(), interval 10 minute)
-             )",
+            "create table `{}.{}.{}` like `{}.{}.{}` options(expiration_timestamp=timestamp_add(current_timestamp(), interval 10 minute))",
             self.project_id, dataset_id, temp_table, self.project_id, dataset_id, base_table
         );
 
