@@ -118,22 +118,22 @@ impl BigQueryClient {
             &Type::JSON | &Type::JSONB => "json",
             &Type::OID => "int64",
             &Type::BYTEA => "bytes",
-            // &Type::BOOL_ARRAY => "array<bool>",
-            // &Type::CHAR_ARRAY
-            // | &Type::BPCHAR_ARRAY
-            // | &Type::VARCHAR_ARRAY
-            // | &Type::NAME_ARRAY
-            // | &Type::TEXT_ARRAY => "array<string>",
-            // &Type::INT2_ARRAY | &Type::INT4_ARRAY | &Type::INT8_ARRAY => "array<int64>",
-            // &Type::FLOAT4_ARRAY | &Type::FLOAT8_ARRAY => "array<float64>",
-            // &Type::NUMERIC_ARRAY => "array<float64>",
-            // &Type::DATE_ARRAY => "array<date>",
-            // &Type::TIME_ARRAY => "array<time>",
-            // &Type::TIMESTAMP_ARRAY | &Type::TIMESTAMPTZ_ARRAY => "array<timestamp>",
-            // &Type::UUID_ARRAY => "array<string>",
-            // &Type::JSON_ARRAY | &Type::JSONB_ARRAY => "array<json>",
-            // &Type::OID_ARRAY => "array<int64>",
-            // &Type::BYTEA_ARRAY => "array<bytes>",
+            &Type::BOOL_ARRAY => "json",
+            &Type::CHAR_ARRAY
+            | &Type::BPCHAR_ARRAY
+            | &Type::VARCHAR_ARRAY
+            | &Type::NAME_ARRAY
+            | &Type::TEXT_ARRAY => "json",
+            &Type::INT2_ARRAY | &Type::INT4_ARRAY | &Type::INT8_ARRAY => "json",
+            &Type::FLOAT4_ARRAY | &Type::FLOAT8_ARRAY => "json",
+            &Type::NUMERIC_ARRAY => "json",
+            &Type::DATE_ARRAY => "json",
+            &Type::TIME_ARRAY => "json",
+            &Type::TIMESTAMP_ARRAY | &Type::TIMESTAMPTZ_ARRAY => "json",
+            &Type::UUID_ARRAY => "json",
+            &Type::JSON_ARRAY | &Type::JSONB_ARRAY => "json",
+            &Type::OID_ARRAY => "json",
+            &Type::BYTEA_ARRAY => "json",
             _ => "string",
         }
     }
@@ -460,7 +460,12 @@ impl BigQueryClient {
                 let bytes: String = b.iter().map(|b| *b as char).collect();
                 s.push_str(&format!("b'{bytes}'"))
             }
-            Cell::Array(_) => unreachable!(),
+            Cell::Array(array_cell) => {
+                let json_str = array_cell_to_json(array_cell);
+                // Escape single quotes in JSON for SQL
+                let escaped_json = json_str.replace("'", "\\'");
+                s.push_str(&format!("'{}'", escaped_json));
+            }
         }
     }
 
@@ -658,11 +663,11 @@ impl BigQueryClient {
         column: &ColumnSchema,
     ) -> Result<(), BQError> {
         let column_type = Self::postgres_to_bigquery_type(&column.typ);
-        let nullable = if column.nullable { "" } else { " NOT NULL" };
 
+        // can't add a not null column into an existing table
         let query = format!(
-            "ALTER TABLE `{}.{}.{}` ADD COLUMN {} {}{}",
-            self.project_id, dataset_id, table_name, column.name, column_type, nullable
+            "alter table `{}.{}.{}` add column {} {}",
+            self.project_id, dataset_id, table_name, column.name, column_type
         );
 
         self.query(query).await?;
@@ -1164,207 +1169,13 @@ impl Cell {
 
 impl ArrayCell {
     fn encode_raw(self, tag: u32, buf: &mut impl BufMut) {
-        match self {
-            ArrayCell::Null => {}
-            ArrayCell::Bool(mut vec) => {
-                let vec: Vec<bool> = vec.drain(..).flatten().collect();
-                ::prost::encoding::bool::encode_packed(tag, &vec, buf);
-            }
-            ArrayCell::String(mut vec) => {
-                let vec: Vec<String> = vec.drain(..).flatten().collect();
-                ::prost::encoding::string::encode_repeated(tag, &vec, buf);
-            }
-            ArrayCell::I16(mut vec) => {
-                let vec: Vec<i32> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap() as i32)
-                    .collect();
-                ::prost::encoding::int32::encode_packed(tag, &vec, buf);
-            }
-            ArrayCell::I32(mut vec) => {
-                let vec: Vec<i32> = vec.drain(..).flatten().collect();
-                ::prost::encoding::int32::encode_packed(tag, &vec, buf);
-            }
-            ArrayCell::U32(mut vec) => {
-                let vec: Vec<u32> = vec.drain(..).flatten().collect();
-                ::prost::encoding::uint32::encode_packed(tag, &vec, buf);
-            }
-            ArrayCell::I64(mut vec) => {
-                let vec: Vec<i64> = vec.drain(..).flatten().collect();
-                ::prost::encoding::int64::encode_packed(tag, &vec, buf);
-            }
-            ArrayCell::F32(mut vec) => {
-                let vec: Vec<f32> = vec.drain(..).flatten().collect();
-                ::prost::encoding::float::encode_packed(tag, &vec, buf);
-            }
-            ArrayCell::F64(mut vec) => {
-                let vec: Vec<f64> = vec.drain(..).flatten().collect();
-                ::prost::encoding::double::encode_packed(tag, &vec, buf);
-            }
-            ArrayCell::Numeric(mut vec) => {
-                let vec: Vec<f64> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().to_f64())
-                    .collect();
-                ::prost::encoding::double::encode_repeated(tag, &vec, buf);
-            }
-            ArrayCell::Date(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().format("%Y-%m-%d").to_string())
-                    .collect();
-                ::prost::encoding::string::encode_repeated(tag, &vec, buf);
-            }
-            ArrayCell::Time(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().format("%H:%M:%S%.f").to_string())
-                    .collect();
-                ::prost::encoding::string::encode_repeated(tag, &vec, buf);
-            }
-            ArrayCell::TimeStamp(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string())
-                    .collect();
-                ::prost::encoding::string::encode_repeated(tag, &vec, buf);
-            }
-            ArrayCell::TimeStampTz(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().format("%Y-%m-%d %H:%M:%S%.f%:z").to_string())
-                    .collect();
-                ::prost::encoding::string::encode_repeated(tag, &vec, buf);
-            }
-            ArrayCell::Uuid(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().to_string())
-                    .collect();
-                ::prost::encoding::string::encode_repeated(tag, &vec, buf);
-            }
-            ArrayCell::Json(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().to_string())
-                    .collect();
-                ::prost::encoding::string::encode_repeated(tag, &vec, buf);
-            }
-            ArrayCell::Bytes(mut vec) => {
-                let vec: Vec<Vec<u8>> = vec.drain(..).flatten().collect();
-                ::prost::encoding::bytes::encode_repeated(tag, &vec, buf);
-            }
-        }
+        let json_str = array_cell_to_json(&self);
+        ::prost::encoding::string::encode(tag, &json_str, buf);
     }
 
     fn encoded_len(self, tag: u32) -> usize {
-        match self {
-            ArrayCell::Null => 0,
-            ArrayCell::Bool(mut vec) => {
-                let vec: Vec<bool> = vec.drain(..).flatten().collect();
-                ::prost::encoding::bool::encoded_len_packed(tag, &vec)
-            }
-            ArrayCell::String(mut vec) => {
-                let vec: Vec<String> = vec.drain(..).flatten().collect();
-                ::prost::encoding::string::encoded_len_repeated(tag, &vec)
-            }
-            ArrayCell::I16(mut vec) => {
-                let vec: Vec<i32> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap() as i32)
-                    .collect();
-                ::prost::encoding::int32::encoded_len_packed(tag, &vec)
-            }
-            ArrayCell::I32(mut vec) => {
-                let vec: Vec<i32> = vec.drain(..).flatten().collect();
-                ::prost::encoding::int32::encoded_len_packed(tag, &vec)
-            }
-            ArrayCell::U32(mut vec) => {
-                let vec: Vec<u32> = vec.drain(..).flatten().collect();
-                ::prost::encoding::uint32::encoded_len_packed(tag, &vec)
-            }
-            ArrayCell::I64(mut vec) => {
-                let vec: Vec<i64> = vec.drain(..).flatten().collect();
-                ::prost::encoding::int64::encoded_len_packed(tag, &vec)
-            }
-            ArrayCell::F32(mut vec) => {
-                let vec: Vec<f32> = vec.drain(..).flatten().collect();
-                ::prost::encoding::float::encoded_len_packed(tag, &vec)
-            }
-            ArrayCell::F64(mut vec) => {
-                let vec: Vec<f64> = vec.drain(..).flatten().collect();
-                ::prost::encoding::double::encoded_len_packed(tag, &vec)
-            }
-            ArrayCell::Numeric(mut vec) => {
-                let vec: Vec<f64> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().to_f64())
-                    .collect();
-                ::prost::encoding::double::encoded_len_repeated(tag, &vec)
-            }
-            ArrayCell::Date(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().format("%Y-%m-%d").to_string())
-                    .collect();
-                ::prost::encoding::string::encoded_len_repeated(tag, &vec)
-            }
-            ArrayCell::Time(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().format("%H:%M:%S%.f").to_string())
-                    .collect();
-                ::prost::encoding::string::encoded_len_repeated(tag, &vec)
-            }
-            ArrayCell::TimeStamp(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string())
-                    .collect();
-                ::prost::encoding::string::encoded_len_repeated(tag, &vec)
-            }
-            ArrayCell::TimeStampTz(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().format("%Y-%m-%d %H:%M:%S%.f%:z").to_string())
-                    .collect();
-                ::prost::encoding::string::encoded_len_repeated(tag, &vec)
-            }
-            ArrayCell::Uuid(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().to_string())
-                    .collect();
-                ::prost::encoding::string::encoded_len_repeated(tag, &vec)
-            }
-            ArrayCell::Json(mut vec) => {
-                let vec: Vec<String> = vec
-                    .drain(..)
-                    .filter(|v| v.is_some())
-                    .map(|v| v.unwrap().to_string())
-                    .collect();
-                ::prost::encoding::string::encoded_len_repeated(tag, &vec)
-            }
-            ArrayCell::Bytes(mut vec) => {
-                let vec: Vec<Vec<u8>> = vec.drain(..).flatten().collect();
-                ::prost::encoding::bytes::encoded_len_repeated(tag, &vec)
-            }
-        }
+        let json_str = array_cell_to_json(&self);
+        ::prost::encoding::string::encoded_len(tag, &json_str)
     }
 
     fn clear(&mut self) {
@@ -1419,18 +1230,18 @@ pub fn table_schema_to_descriptor(table_schema: &TableSchema) -> TableDescriptor
             Type::JSONB => ColumnType::String,
             Type::OID => ColumnType::Int32,
             Type::BYTEA => ColumnType::Bytes,
-            Type::BOOL_ARRAY => ColumnType::Bool,
+            Type::BOOL_ARRAY => ColumnType::String,
             Type::CHAR_ARRAY
             | Type::BPCHAR_ARRAY
             | Type::VARCHAR_ARRAY
             | Type::NAME_ARRAY
             | Type::TEXT_ARRAY => ColumnType::String,
-            Type::INT2_ARRAY => ColumnType::Int32,
-            Type::INT4_ARRAY => ColumnType::Int32,
-            Type::INT8_ARRAY => ColumnType::Int64,
-            Type::FLOAT4_ARRAY => ColumnType::Float,
-            Type::FLOAT8_ARRAY => ColumnType::Double,
-            Type::NUMERIC_ARRAY => ColumnType::Double,
+            Type::INT2_ARRAY => ColumnType::String,
+            Type::INT4_ARRAY => ColumnType::String,
+            Type::INT8_ARRAY => ColumnType::String,
+            Type::FLOAT4_ARRAY => ColumnType::String,
+            Type::FLOAT8_ARRAY => ColumnType::String,
+            Type::NUMERIC_ARRAY => ColumnType::String,
             Type::DATE_ARRAY => ColumnType::String,
             Type::TIME_ARRAY => ColumnType::String,
             Type::TIMESTAMP_ARRAY => ColumnType::String,
@@ -1438,8 +1249,8 @@ pub fn table_schema_to_descriptor(table_schema: &TableSchema) -> TableDescriptor
             Type::UUID_ARRAY => ColumnType::String,
             Type::JSON_ARRAY => ColumnType::String,
             Type::JSONB_ARRAY => ColumnType::String,
-            Type::OID_ARRAY => ColumnType::Int32,
-            Type::BYTEA_ARRAY => ColumnType::Bytes,
+            Type::OID_ARRAY => ColumnType::String,
+            Type::BYTEA_ARRAY => ColumnType::String,
             _ => ColumnType::String,
         };
 
@@ -1550,6 +1361,93 @@ impl PgNumeric {
             PgNumeric::PositiveInf => f64::INFINITY,
             PgNumeric::NegativeInf => f64::NEG_INFINITY,
             PgNumeric::Value(bd) => bd.to_string().parse::<f64>().unwrap_or(f64::NAN),
+        }
+    }
+}
+
+// Convert ArrayCell to JSON string
+fn array_cell_to_json(array_cell: &ArrayCell) -> String {
+    match array_cell {
+        ArrayCell::Null => "null".to_string(),
+        ArrayCell::Bool(vec) => {
+            let values: Vec<bool> = vec.iter().flatten().copied().collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::String(vec) => {
+            let values: Vec<String> = vec.iter().flatten().cloned().collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::I16(vec) => {
+            let values: Vec<i16> = vec.iter().flatten().copied().collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::I32(vec) => {
+            let values: Vec<i32> = vec.iter().flatten().copied().collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::U32(vec) => {
+            let values: Vec<u32> = vec.iter().flatten().copied().collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::I64(vec) => {
+            let values: Vec<i64> = vec.iter().flatten().copied().collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::F32(vec) => {
+            let values: Vec<f32> = vec.iter().flatten().copied().collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::F64(vec) => {
+            let values: Vec<f64> = vec.iter().flatten().copied().collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::Numeric(vec) => {
+            let values: Vec<f64> = vec.iter().flatten().map(|n| n.to_f64()).collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::Date(vec) => {
+            let values: Vec<String> = vec
+                .iter()
+                .flatten()
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::Time(vec) => {
+            let values: Vec<String> = vec
+                .iter()
+                .flatten()
+                .map(|t| t.format("%H:%M:%S%.f").to_string())
+                .collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::TimeStamp(vec) => {
+            let values: Vec<String> = vec
+                .iter()
+                .flatten()
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+                .collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::TimeStampTz(vec) => {
+            let values: Vec<String> = vec
+                .iter()
+                .flatten()
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f%:z").to_string())
+                .collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::Uuid(vec) => {
+            let values: Vec<String> = vec.iter().flatten().map(|u| u.to_string()).collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::Json(vec) => {
+            let values: Vec<String> = vec.iter().flatten().map(|j| j.to_string()).collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
+        }
+        ArrayCell::Bytes(vec) => {
+            let values: Vec<Vec<u8>> = vec.iter().flatten().cloned().collect();
+            serde_json::to_string(&values).unwrap_or("[]".to_string())
         }
     }
 }

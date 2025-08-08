@@ -3,4 +3,4 @@ pipeline:
   publication_name: "bqpub"
   batch:
     max_size: 100000
-    max_fill_ms: 60000
+    max_fill_ms: 10000
