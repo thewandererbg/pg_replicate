@@ -9,6 +9,7 @@ pub enum TableModification<'a> {
     AddColumn { name: &'a str, data_type: &'a str },
     DropColumn { name: &'a str },
     AlterColumn { name: &'a str, alteration: &'a str },
+    ReplicaIdentity { value: &'a str },
 }
 
 pub struct PgDatabase<G> {
@@ -106,6 +107,9 @@ impl<G: GenericClient> PgDatabase<G> {
                 }
                 TableModification::AlterColumn { name, alteration } => {
                     format!("alter column {name} {alteration}")
+                }
+                TableModification::ReplicaIdentity { value } => {
+                    format!("replica identity {value}")
                 }
             })
             .collect::<Vec<_>>()
@@ -277,6 +281,11 @@ impl<G: GenericClient> PgDatabase<G> {
             .await?;
 
         Ok(row.get(0))
+    }
+
+    /// Executes arbitrary SQL on the database.
+    pub async fn run_sql(&self, sql: &str) -> Result<u64, tokio_postgres::Error> {
+        self.client.as_ref().unwrap().execute(sql, &[]).await
     }
 }
 
