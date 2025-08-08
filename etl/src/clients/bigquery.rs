@@ -702,6 +702,7 @@ impl BigQueryClient {
         base_table: &str,
         table_descriptor: &TableDescriptor,
         update_rows: &[TableRow],
+        has_deletes: bool,
     ) -> Result<(), BQError> {
         let table_info = self.get_table_info(dataset_id, base_table).await?;
         let table_info = match table_info {
@@ -713,6 +714,7 @@ impl BigQueryClient {
 
         let partition_type = self.get_partition_type(&table_info);
         let partition_column = self.get_partition_column(&table_info);
+        let table_fields = self.get_table_fields(&table_info);
 
         let num_bytes: u64 = table_info
             .num_bytes
@@ -721,58 +723,48 @@ impl BigQueryClient {
             .unwrap_or(0);
         let streaming_buffer = table_info.streaming_buffer.is_some();
 
+        info!("rows has delete: {}", has_deletes);
         info!("{} size: {} bytes", base_table, num_bytes);
         info!("{} has streaming buffer: {}", base_table, streaming_buffer);
         info!("{} has partition column: {}", base_table, partition_column);
 
         // 40MB is the minimum bytes billed for any partition replacement.
         // Stream directly into table if it's lower than 40MB
-        if partition_type == "NONE"
-            || partition_column == ""
-            || streaming_buffer
-            || num_bytes < 40 * 1024 * 1024
+        if partition_type == "NONE" || partition_column == "" || streaming_buffer || has_deletes
+        // || num_bytes < 40 * 1024 * 1024
         {
             info!("Streaming rows into {}", base_table);
             self.stream_rows(dataset_id, base_table, table_descriptor, update_rows)
                 .await?;
         } else {
-            info!(
-                "Inserting rows into {} by partition replacement",
-                base_table
-            );
-            self.insert_rows_by_partition_replacement(
+            info!("Inserting rows into {} by partition merge", base_table);
+            self.insert_rows_by_partition_merge(
                 dataset_id,
                 base_table,
                 table_descriptor,
                 update_rows,
                 &partition_column,
+                table_fields,
             )
             .await?;
         }
         Ok(())
     }
 
-    pub async fn insert_rows_by_partition_replacement(
+    pub async fn insert_rows_by_partition_merge(
         &mut self,
         dataset_id: &str,
         base_table: &str,
         table_descriptor: &TableDescriptor,
         update_rows: &[TableRow],
         partition_column: &str,
+        table_fields: Vec<String>,
     ) -> Result<(), BQError> {
         let temp_table = format!("{}_temp_{}", base_table, Utc::now().timestamp());
 
         let affected_partitions = self
-            .get_affected_partitions(
-                update_rows,
-                table_descriptor,
-                dataset_id,
-                base_table,
-                partition_column,
-            )
+            .get_affected_partitions(update_rows, table_descriptor, partition_column)
             .await?;
-
-        info!("Affected partitions: {:?}", affected_partitions);
 
         // 1. Create temp table with final desired state
         self.create_final_state_table(
@@ -781,23 +773,21 @@ impl BigQueryClient {
             base_table,
             table_descriptor,
             update_rows,
-            &affected_partitions,
-            partition_column,
         )
         .await?;
 
         // 2. Replace partitions
-        self.execute_partition_replacement(
+        self.execute_partition_merge(
             dataset_id,
             base_table,
             &temp_table,
             &affected_partitions,
             partition_column,
+            table_fields,
         )
         .await?;
 
         // 3. Cleanup.
-        // Ignore failed because we already have ttl for temp table
         let _ = self.drop_table(dataset_id, &temp_table).await;
 
         Ok(())
@@ -810,24 +800,12 @@ impl BigQueryClient {
         base_table: &str,
         table_descriptor: &TableDescriptor,
         update_rows: &[TableRow],
-        affected_partitions: &[String],
-        partition_column: &str,
     ) -> Result<(), BQError> {
         // 1. Create empty temp table with same schema as base table
         self.create_temp_table(dataset_id, temp_table, base_table)
             .await?;
 
-        // 2. Copy existing data from unaffected partitions to temp table
-        self.copy_existing_partitions(
-            dataset_id,
-            temp_table,
-            base_table,
-            &affected_partitions,
-            partition_column,
-        )
-        .await?;
-
-        // 3. Add the new/updated records via streaming
+        // 2. Add the new/updated records via streaming
         self.stream_rows(dataset_id, temp_table, table_descriptor, update_rows)
             .await?;
 
@@ -849,89 +827,23 @@ impl BigQueryClient {
         Ok(())
     }
 
-    async fn copy_existing_partitions(
-        &mut self,
-        dataset_id: &str,
-        temp_table: &str,
-        base_table: &str,
-        affected_partitions: &[String],
-        partition_column: &str,
-    ) -> Result<(), BQError> {
-        let partition_filter = affected_partitions
-            .iter()
-            .map(|p| format!("'{}'", p))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let query = format!(
-            "insert into `{}.{}.{}` select * from `{}.{}.{}` where date({}) in ({})",
-            self.project_id,
-            dataset_id,
-            temp_table,
-            self.project_id,
-            dataset_id,
-            base_table,
-            partition_column,
-            partition_filter
-        );
-
-        self.query(query).await?;
-        Ok(())
-    }
-
     async fn get_affected_partitions(
         &self,
         update_rows: &[TableRow],
         table_descriptor: &TableDescriptor,
-        dataset_id: &str,
-        table_name: &str,
         partition_column: &str,
     ) -> Result<Vec<String>, BQError> {
         let mut partitions = HashSet::new();
-        let mut delete_ids = Vec::new();
-
-        // Find the id field index once
-        let id_field_index = table_descriptor
-            .field_descriptors
-            .iter()
-            .position(|field| field.name == "id")
-            .ok_or_else(|| BQError::InvalidColumnName {
-                col_name: "id".to_string(),
-            })?;
 
         // Process rows
         for row in update_rows {
-            if row.is_delete() {
-                // Extract id for delete rows
-                let id_cell = &row.values[id_field_index];
-                let mut id_value = String::new();
-                Self::cell_to_query_value(id_cell, &mut id_value);
-                delete_ids.push(id_value);
-            } else {
-                // Get partition date for non-delete rows
-                let partition_date = row
-                    .get_partition_date(table_descriptor, partition_column)
-                    .map_err(|e| BQError::InvalidColumnName {
-                        col_name: format!("{}: {}", partition_column, e),
-                    })?;
-                partitions.insert(partition_date);
-            }
-        }
-
-        // Query partitions for delete rows if any exist
-        if !delete_ids.is_empty() {
-            let query = format!(
-                "select distinct format_date('%Y-%m-%d', {}) as partition_date from `{}.{}.{}` where id in ({})",
-                partition_column, self.project_id, dataset_id, table_name, delete_ids.join(", ")
-            );
-
-            let mut result_set = self.query(query).await?;
-            while result_set.next_row() {
-                let partition_date = result_set
-                    .get_string_by_name("partition_date")?
-                    .ok_or(BQError::NoDataAvailable)?;
-                partitions.insert(partition_date);
-            }
+            // Get partition date for non-delete rows
+            let partition_date = row
+                .get_partition_date(table_descriptor, partition_column)
+                .map_err(|e| BQError::InvalidColumnName {
+                    col_name: format!("{}: {}", partition_column, e),
+                })?;
+            partitions.insert(partition_date);
         }
 
         let mut partitions_vec: Vec<String> = partitions.into_iter().collect();
@@ -939,13 +851,14 @@ impl BigQueryClient {
         Ok(partitions_vec)
     }
 
-    async fn execute_partition_replacement(
+    async fn execute_partition_merge(
         &mut self,
         dataset_id: &str,
         base_table: &str,
         temp_table: &str,
         affected_partitions: &[String],
         partition_column: &str,
+        table_fields: Vec<String>,
     ) -> Result<(), BQError> {
         let partition_filter = affected_partitions
             .iter()
@@ -953,8 +866,13 @@ impl BigQueryClient {
             .collect::<Vec<_>>()
             .join(",");
 
+        let update_assignments: Vec<String> = table_fields
+            .iter()
+            .map(|field_name| format!("t.{} = s.{}", field_name, field_name))
+            .collect();
+
         let merge_query = format!(
-            "merge `{}.{}.{}` t using `{}.{}.{}` s on false when not matched by source and date(t.`{}`) in ({}) then delete when not matched then insert row",
+            "merge `{}.{}.{}` t using `{}.{}.{}` s on t.id = s.id and date(t.`{}`) in ({}) when matched then update set {} when not matched then insert row",
             self.project_id,
             dataset_id,
             base_table,
@@ -962,7 +880,8 @@ impl BigQueryClient {
             dataset_id,
             temp_table,
             partition_column,
-            partition_filter
+            partition_filter,
+            update_assignments.join(", ")
         );
 
         self.query(merge_query).await?;
@@ -983,6 +902,15 @@ impl BigQueryClient {
             .as_ref()
             .and_then(|tp| tp.field.clone())
             .unwrap_or("".to_string())
+    }
+
+    fn get_table_fields(&self, table: &Table) -> Vec<String> {
+        table
+            .schema
+            .fields
+            .as_ref()
+            .map(|fields| fields.iter().map(|field| field.name.clone()).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1347,10 +1275,6 @@ impl TableRow {
             Some(other) => Err(format!("Unexpected date type: {:?}", other).into()),
             None => Err("Created_at column index out of bounds".into()),
         }
-    }
-
-    pub fn is_delete(&self) -> bool {
-        self.values[self.values.len() - 2] == Cell::String("DELETE".to_string())
     }
 }
 
