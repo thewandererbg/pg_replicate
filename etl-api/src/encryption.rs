@@ -1,11 +1,11 @@
+use std::string;
+
 use aws_lc_rs::{
     aead::{AES_256_GCM, Aad, Nonce, RandomizedNonceKey},
     rand::fill,
 };
-use base64::Engine;
-use base64::prelude::BASE64_STANDARD;
+use base64::{Engine, prelude::BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
-use std::string;
 use thiserror::Error;
 
 /// Errors that can occur during encryption operations.
