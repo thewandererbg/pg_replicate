@@ -213,6 +213,7 @@ impl BatchDestination for BigQueryBatchDestination {
 
     async fn write_cdc_events(&mut self, events: Vec<CdcEvent>) -> Result<PgLsn, Self::Error> {
         let mut table_name_to_table_rows = HashMap::new();
+        let mut tables_with_deletes = HashSet::new();
         let mut new_last_lsn = PgLsn::from(0);
         for (i, event) in events.into_iter().enumerate() {
             // info!("{event:?}");
@@ -258,6 +259,7 @@ impl BatchDestination for BigQueryBatchDestination {
                     table_rows.push(table_row);
                 }
                 CdcEvent::Delete((table_id, mut table_row)) => {
+                    tables_with_deletes.insert(table_id);
                     table_row.values.push(Cell::String("DELETE".to_string()));
                     table_row.values.push(Cell::String(format!(
                         "{}/{:X}",
@@ -310,52 +312,43 @@ impl BatchDestination for BigQueryBatchDestination {
             }
         }
 
-        // for (table_id, table_rows) in table_name_to_table_rows {
-        //     let table_schema = self.get_table_schema(table_id)?;
-        //     let table_name = Self::table_name_in_bq(&table_schema.name);
-        //     let table_descriptor = table_schema_to_descriptor(table_schema);
-
-        //     self.client
-        //         .upsert_rows(
-        //             &self.dataset_id,
-        //             &table_name,
-        //             &table_descriptor,
-        //             &table_rows,
-        //         )
-        //         .await?;
-        // }
-
         // Gather all the preparation data first
         let prepared_data: Result<
-            Vec<(String, TableDescriptor, Vec<TableRow>)>,
+            Vec<(u32, String, TableDescriptor, Vec<TableRow>)>,
             BigQueryDestinationError,
-        > =
-            table_name_to_table_rows
-                .into_iter()
-                .map(
-                    |(table_id, table_rows)| -> Result<
-                        (String, TableDescriptor, Vec<TableRow>),
-                        BigQueryDestinationError,
-                    > {
-                        let table_schema = self.get_table_schema(table_id)?;
-                        let table_name = Self::table_name_in_bq(&table_schema.name);
-                        let table_descriptor = table_schema_to_descriptor(table_schema);
-                        Ok((table_name, table_descriptor, table_rows))
-                    },
-                )
-                .collect();
+        > = table_name_to_table_rows
+            .into_iter()
+            .map(
+                |(table_id, table_rows)| -> Result<
+                    (u32, String, TableDescriptor, Vec<TableRow>),
+                    BigQueryDestinationError,
+                > {
+                    let table_schema = self.get_table_schema(table_id)?;
+                    let table_name = Self::table_name_in_bq(&table_schema.name);
+                    let table_descriptor = table_schema_to_descriptor(table_schema);
+                    Ok((table_id, table_name, table_descriptor, table_rows))
+                },
+            )
+            .collect();
 
         let prepared_data = prepared_data?;
 
         // Now run all upsert operations concurrently
         let tasks: Vec<_> = prepared_data
             .into_iter()
-            .map(|(table_name, table_descriptor, table_rows)| {
+            .map(|(table_id, table_name, table_descriptor, table_rows)| {
                 let dataset_id = self.dataset_id.clone();
                 let mut client = self.client.clone();
+                let has_deletes = tables_with_deletes.contains(&table_id);
                 async move {
                     client
-                        .upsert_rows(&dataset_id, &table_name, &table_descriptor, &table_rows)
+                        .upsert_rows(
+                            &dataset_id,
+                            &table_name,
+                            &table_descriptor,
+                            &table_rows,
+                            has_deletes,
+                        )
                         .await
                 }
             })
