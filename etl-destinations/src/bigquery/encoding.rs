@@ -1,29 +1,64 @@
-use etl::types::{ArrayCell, Cell, TableRow};
+use etl::error::{EtlError, EtlResult};
+use etl::types::{ArrayCellNonOptional, CellNonOptional, TableRow};
 use prost::bytes;
 
-/// Wrapper around [`TableRow`] that implements protobuf encoding for BigQuery.
+/// Date format string for BigQuery DATE columns (YYYY-MM-DD).
+const DATE_FORMAT: &str = "%Y-%m-%d";
+
+/// Time format string for BigQuery TIME columns (HH:MM:SS.sss).
+const TIME_FORMAT: &str = "%H:%M:%S%.f";
+
+/// Timestamp format string for BigQuery TIMESTAMP columns (YYYY-MM-DD HH:MM:SS.sss).
+const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
+
+/// Timestamp with timezone format string for BigQuery TIMESTAMPTZ columns (YYYY-MM-DD HH:MM:SS.sss+TZ).
+const TIMESTAMPTZ_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f%:z";
+
+/// Protocol buffer wrapper for a BigQuery table row containing non-optional cells.
 ///
-/// Enables serialization of table rows using the protobuf format required by
-/// BigQuery's Storage Write API.
+/// Wraps a vector of [`CellNonOptional`] values and implements the [`prost::Message`]
+/// trait to enable Protocol Buffer serialization for BigQuery streaming inserts.
 #[derive(Debug)]
-pub struct BigQueryTableRow(pub TableRow);
+pub struct BigQueryTableRow(Vec<CellNonOptional>);
+
+impl TryFrom<TableRow> for BigQueryTableRow {
+    type Error = EtlError;
+
+    /// Converts a [`TableRow`] to a [`BigQueryTableRow`] by transforming all cell values
+    /// to their non-optional equivalents.
+    ///
+    /// Returns an error if any cell conversion fails during the transformation process.
+    fn try_from(value: TableRow) -> Result<Self, Self::Error> {
+        let table_rows = value
+            .values
+            .into_iter()
+            .map(CellNonOptional::try_from)
+            .collect::<EtlResult<Vec<_>>>()?;
+
+        Ok(BigQueryTableRow(table_rows))
+    }
+}
 
 impl prost::Message for BigQueryTableRow {
-    /// Encodes the table row using protobuf format for BigQuery streaming.
+    /// Encodes the table row into the provided buffer using Protocol Buffer format.
+    ///
+    /// Each cell is encoded with a sequential tag starting from 1, using the
+    /// appropriate prost encoding method for the cell's data type.
     fn encode_raw(&self, buf: &mut impl bytes::BufMut)
     where
         Self: Sized,
     {
         let mut tag = 1;
-        for cell in &self.0.values {
+        for cell in &self.0 {
             cell_encode_prost(cell, tag, buf);
             tag += 1;
         }
     }
 
-    /// Merges protobuf field data into the table row.
+    /// Merges a field from a Protocol Buffer message into this table row.
     ///
-    /// Not implemented as decoding is not required for the BigQuery use case.
+    /// Currently unimplemented as this functionality is not required for BigQuery
+    /// streaming inserts, which only need encoding capabilities.
     fn merge_field(
         &mut self,
         _tag: u32,
@@ -37,11 +72,14 @@ impl prost::Message for BigQueryTableRow {
         unimplemented!("merge_field not implemented yet");
     }
 
-    /// Returns the encoded length of the table row in bytes.
+    /// Calculates the encoded length of the table row in bytes.
+    ///
+    /// Sums the encoded lengths of all cells with their respective tags to
+    /// determine the total serialized size.
     fn encoded_len(&self) -> usize {
         let mut len = 0;
         let mut tag = 1;
-        for cell in &self.0.values {
+        for cell in &self.0 {
             len += cell_encode_len_prost(cell, tag);
             tag += 1;
         }
@@ -49,336 +87,283 @@ impl prost::Message for BigQueryTableRow {
         len
     }
 
-    /// Clears all cell values in the table row.
+    /// Clears all cell values in the table row by calling clear on each cell.
     fn clear(&mut self) {
-        for cell in &mut self.0.values {
+        for cell in &mut self.0 {
             cell.clear();
         }
     }
 }
 
-/// Encodes a single [`Cell`] value using protobuf format.
+/// Encodes a single [`CellNonOptional`] into Protocol Buffer format using the specified tag.
 ///
-/// Maps each cell type to its appropriate protobuf encoding method,
-/// handling type conversion and formatting as needed for BigQuery.
-pub fn cell_encode_prost(cell: &Cell, tag: u32, buf: &mut impl bytes::BufMut) {
+/// Each cell type is encoded using the appropriate prost encoding method. Temporal types
+/// and UUIDs are formatted as strings, while numeric types use their native encoding.
+/// Null cells produce no encoded output.
+pub fn cell_encode_prost(cell: &CellNonOptional, tag: u32, buf: &mut impl bytes::BufMut) {
     match cell {
-        Cell::Null => {}
-        Cell::Bool(b) => {
+        CellNonOptional::Null => {}
+        CellNonOptional::Bool(b) => {
             prost::encoding::bool::encode(tag, b, buf);
         }
-        Cell::String(s) => {
+        CellNonOptional::String(s) => {
             prost::encoding::string::encode(tag, s, buf);
         }
-        Cell::I16(i) => {
+        CellNonOptional::I16(i) => {
             let val = *i as i32;
             prost::encoding::int32::encode(tag, &val, buf);
         }
-        Cell::I32(i) => {
+        CellNonOptional::I32(i) => {
             prost::encoding::int32::encode(tag, i, buf);
         }
-        Cell::I64(i) => {
+        CellNonOptional::I64(i) => {
             prost::encoding::int64::encode(tag, i, buf);
         }
-        Cell::F32(i) => {
+        CellNonOptional::F32(i) => {
             prost::encoding::float::encode(tag, i, buf);
         }
-        Cell::F64(i) => {
+        CellNonOptional::F64(i) => {
             prost::encoding::double::encode(tag, i, buf);
         }
-        Cell::Numeric(n) => {
+        CellNonOptional::Numeric(n) => {
             let s = n.to_string();
             prost::encoding::string::encode(tag, &s, buf);
         }
-        Cell::Date(t) => {
-            let s = t.format("%Y-%m-%d").to_string();
+        CellNonOptional::Date(t) => {
+            let s = t.format(DATE_FORMAT).to_string();
             prost::encoding::string::encode(tag, &s, buf);
         }
-        Cell::Time(t) => {
-            let s = t.format("%H:%M:%S%.f").to_string();
+        CellNonOptional::Time(t) => {
+            let s = t.format(TIME_FORMAT).to_string();
             prost::encoding::string::encode(tag, &s, buf);
         }
-        Cell::TimeStamp(t) => {
-            let s = t.format("%Y-%m-%d %H:%M:%S%.f").to_string();
+        CellNonOptional::TimeStamp(t) => {
+            let s = t.format(TIMESTAMP_FORMAT).to_string();
             prost::encoding::string::encode(tag, &s, buf);
         }
-        Cell::TimeStampTz(t) => {
-            let s = t.format("%Y-%m-%d %H:%M:%S%.f%:z").to_string();
+        CellNonOptional::TimeStampTz(t) => {
+            let s = t.format(TIMESTAMPTZ_FORMAT).to_string();
             prost::encoding::string::encode(tag, &s, buf);
         }
-        Cell::Uuid(u) => {
+        CellNonOptional::Uuid(u) => {
             let s = u.to_string();
             prost::encoding::string::encode(tag, &s, buf)
         }
-        Cell::Json(j) => {
+        CellNonOptional::Json(j) => {
             let s = j.to_string();
             prost::encoding::string::encode(tag, &s, buf)
         }
-        Cell::U32(i) => {
+        CellNonOptional::U32(i) => {
             prost::encoding::uint32::encode(tag, i, buf);
         }
-        Cell::Bytes(b) => {
+        CellNonOptional::Bytes(b) => {
             prost::encoding::bytes::encode(tag, b, buf);
         }
-        Cell::Array(a) => {
+        CellNonOptional::Array(a) => {
             array_cell_encode_prost(a.clone(), tag, buf);
         }
     }
 }
 
-/// Returns the encoded length of a [`Cell`] in protobuf format.
-pub fn cell_encode_len_prost(cell: &Cell, tag: u32) -> usize {
+/// Calculates the encoded length in bytes for a single [`CellNonOptional`] with the specified tag.
+///
+/// Returns the number of bytes that would be produced when encoding this cell in Protocol
+/// Buffer format. Null cells return zero length, while other types calculate their
+/// encoded size using the corresponding prost length functions.
+pub fn cell_encode_len_prost(cell: &CellNonOptional, tag: u32) -> usize {
     match cell {
-        Cell::Null => 0,
-        Cell::Bool(b) => prost::encoding::bool::encoded_len(tag, b),
-        Cell::String(s) => prost::encoding::string::encoded_len(tag, s),
-        Cell::I16(i) => {
+        CellNonOptional::Null => 0,
+        CellNonOptional::Bool(b) => prost::encoding::bool::encoded_len(tag, b),
+        CellNonOptional::String(s) => prost::encoding::string::encoded_len(tag, s),
+        CellNonOptional::I16(i) => {
             let val = *i as i32;
             prost::encoding::int32::encoded_len(tag, &val)
         }
-        Cell::I32(i) => prost::encoding::int32::encoded_len(tag, i),
-        Cell::I64(i) => prost::encoding::int64::encoded_len(tag, i),
-        Cell::F32(i) => prost::encoding::float::encoded_len(tag, i),
-        Cell::F64(i) => prost::encoding::double::encoded_len(tag, i),
-        Cell::Numeric(n) => {
+        CellNonOptional::I32(i) => prost::encoding::int32::encoded_len(tag, i),
+        CellNonOptional::I64(i) => prost::encoding::int64::encoded_len(tag, i),
+        CellNonOptional::F32(i) => prost::encoding::float::encoded_len(tag, i),
+        CellNonOptional::F64(i) => prost::encoding::double::encoded_len(tag, i),
+        CellNonOptional::Numeric(n) => {
             let s = n.to_string();
             prost::encoding::string::encoded_len(tag, &s)
         }
-        Cell::Date(t) => {
-            let s = t.format("%Y-%m-%d").to_string();
+        CellNonOptional::Date(t) => {
+            let s = t.format(DATE_FORMAT).to_string();
             prost::encoding::string::encoded_len(tag, &s)
         }
-        Cell::Time(t) => {
-            let s = t.format("%H:%M:%S%.f").to_string();
+        CellNonOptional::Time(t) => {
+            let s = t.format(TIME_FORMAT).to_string();
             prost::encoding::string::encoded_len(tag, &s)
         }
-        Cell::TimeStamp(t) => {
-            let s = t.format("%Y-%m-%d %H:%M:%S%.f").to_string();
+        CellNonOptional::TimeStamp(t) => {
+            let s = t.format(TIMESTAMP_FORMAT).to_string();
             prost::encoding::string::encoded_len(tag, &s)
         }
-        Cell::TimeStampTz(t) => {
-            let s = t.format("%Y-%m-%d %H:%M:%S%.f%:z").to_string();
+        CellNonOptional::TimeStampTz(t) => {
+            let s = t.format(TIMESTAMPTZ_FORMAT).to_string();
             prost::encoding::string::encoded_len(tag, &s)
         }
-        Cell::Uuid(u) => {
+        CellNonOptional::Uuid(u) => {
             let s = u.to_string();
             prost::encoding::string::encoded_len(tag, &s)
         }
-        Cell::Json(j) => {
+        CellNonOptional::Json(j) => {
             let s = j.to_string();
             prost::encoding::string::encoded_len(tag, &s)
         }
-        Cell::U32(i) => prost::encoding::uint32::encoded_len(tag, i),
-        Cell::Bytes(b) => prost::encoding::bytes::encoded_len(tag, b),
-        Cell::Array(array_cell) => array_cell_encoded_len_prost(array_cell.clone(), tag),
+        CellNonOptional::U32(i) => prost::encoding::uint32::encoded_len(tag, i),
+        CellNonOptional::Bytes(b) => prost::encoding::bytes::encoded_len(tag, b),
+        CellNonOptional::Array(a) => array_cell_non_optional_encoded_len_prost(a.clone(), tag),
     }
 }
 
-/// Encodes an [`ArrayCell`] using protobuf repeated field format.
+/// Encodes an [`ArrayCellNonOptional`] into Protocol Buffer format using the specified tag.
 ///
-/// Handles PostgreSQL array types by filtering out null values and encoding
-/// the remaining elements using the appropriate protobuf repeated encoding.
-pub fn array_cell_encode_prost(array_cell: ArrayCell, tag: u32, buf: &mut impl bytes::BufMut) {
+/// Array cells are encoded using either packed encoding for numeric types or repeated
+/// encoding for string-based types. Temporal arrays are converted to string arrays
+/// with appropriate formatting before encoding.
+pub fn array_cell_encode_prost(
+    array_cell: ArrayCellNonOptional,
+    tag: u32,
+    buf: &mut impl bytes::BufMut,
+) {
     match array_cell {
-        ArrayCell::Null => {}
-        ArrayCell::Bool(mut vec) => {
-            let vec: Vec<bool> = vec.drain(..).flatten().collect();
+        ArrayCellNonOptional::Null => {}
+        ArrayCellNonOptional::Bool(vec) => {
             prost::encoding::bool::encode_packed(tag, &vec, buf);
         }
-        ArrayCell::String(mut vec) => {
-            let vec: Vec<String> = vec.drain(..).flatten().collect();
+        ArrayCellNonOptional::String(vec) => {
             prost::encoding::string::encode_repeated(tag, &vec, buf);
         }
-        ArrayCell::I16(mut vec) => {
-            let vec: Vec<i32> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap() as i32)
-                .collect();
+        ArrayCellNonOptional::I16(vec) => {
+            let values: Vec<i32> = vec.into_iter().map(|v| v as i32).collect();
+            prost::encoding::int32::encode_packed(tag, &values, buf);
+        }
+        ArrayCellNonOptional::I32(vec) => {
             prost::encoding::int32::encode_packed(tag, &vec, buf);
         }
-        ArrayCell::I32(mut vec) => {
-            let vec: Vec<i32> = vec.drain(..).flatten().collect();
-            prost::encoding::int32::encode_packed(tag, &vec, buf);
-        }
-        ArrayCell::U32(mut vec) => {
-            let vec: Vec<u32> = vec.drain(..).flatten().collect();
+        ArrayCellNonOptional::U32(vec) => {
             prost::encoding::uint32::encode_packed(tag, &vec, buf);
         }
-        ArrayCell::I64(mut vec) => {
-            let vec: Vec<i64> = vec.drain(..).flatten().collect();
+        ArrayCellNonOptional::I64(vec) => {
             prost::encoding::int64::encode_packed(tag, &vec, buf);
         }
-        ArrayCell::F32(mut vec) => {
-            let vec: Vec<f32> = vec.drain(..).flatten().collect();
+        ArrayCellNonOptional::F32(vec) => {
             prost::encoding::float::encode_packed(tag, &vec, buf);
         }
-        ArrayCell::F64(mut vec) => {
-            let vec: Vec<f64> = vec.drain(..).flatten().collect();
+        ArrayCellNonOptional::F64(vec) => {
             prost::encoding::double::encode_packed(tag, &vec, buf);
         }
-        ArrayCell::Numeric(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().to_string())
-                .collect();
-            prost::encoding::string::encode_repeated(tag, &vec, buf);
+        ArrayCellNonOptional::Numeric(vec) => {
+            let values: Vec<String> = vec.into_iter().map(|v| v.to_string()).collect();
+            prost::encoding::string::encode_repeated(tag, &values, buf);
         }
-        ArrayCell::Date(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().format("%Y-%m-%d").to_string())
+        ArrayCellNonOptional::Date(vec) => {
+            let values: Vec<String> = vec
+                .into_iter()
+                .map(|v| v.format(DATE_FORMAT).to_string())
                 .collect();
-            prost::encoding::string::encode_repeated(tag, &vec, buf);
+            prost::encoding::string::encode_repeated(tag, &values, buf);
         }
-        ArrayCell::Time(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().format("%H:%M:%S%.f").to_string())
+        ArrayCellNonOptional::Time(vec) => {
+            let values: Vec<String> = vec
+                .into_iter()
+                .map(|v| v.format(TIME_FORMAT).to_string())
                 .collect();
-            prost::encoding::string::encode_repeated(tag, &vec, buf);
+            prost::encoding::string::encode_repeated(tag, &values, buf);
         }
-        ArrayCell::TimeStamp(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string())
+        ArrayCellNonOptional::TimeStamp(vec) => {
+            let values: Vec<String> = vec
+                .into_iter()
+                .map(|v| v.format(TIMESTAMP_FORMAT).to_string())
                 .collect();
-            prost::encoding::string::encode_repeated(tag, &vec, buf);
+            prost::encoding::string::encode_repeated(tag, &values, buf);
         }
-        ArrayCell::TimeStampTz(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().format("%Y-%m-%d %H:%M:%S%.f%:z").to_string())
+        ArrayCellNonOptional::TimeStampTz(vec) => {
+            let values: Vec<String> = vec
+                .into_iter()
+                .map(|v| v.format(TIMESTAMPTZ_FORMAT).to_string())
                 .collect();
-            prost::encoding::string::encode_repeated(tag, &vec, buf);
+            prost::encoding::string::encode_repeated(tag, &values, buf);
         }
-        ArrayCell::Uuid(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().to_string())
-                .collect();
-            prost::encoding::string::encode_repeated(tag, &vec, buf);
+        ArrayCellNonOptional::Uuid(vec) => {
+            let values: Vec<String> = vec.into_iter().map(|v| v.to_string()).collect();
+            prost::encoding::string::encode_repeated(tag, &values, buf);
         }
-        ArrayCell::Json(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().to_string())
-                .collect();
-            prost::encoding::string::encode_repeated(tag, &vec, buf);
+        ArrayCellNonOptional::Json(vec) => {
+            let values: Vec<String> = vec.into_iter().map(|v| v.to_string()).collect();
+            prost::encoding::string::encode_repeated(tag, &values, buf);
         }
-        ArrayCell::Bytes(mut vec) => {
-            let vec: Vec<Vec<u8>> = vec.drain(..).flatten().collect();
+        ArrayCellNonOptional::Bytes(vec) => {
             prost::encoding::bytes::encode_repeated(tag, &vec, buf);
         }
     }
 }
 
-/// Returns the encoded length of an [`ArrayCell`] in protobuf format.
-pub fn array_cell_encoded_len_prost(array_cell: ArrayCell, tag: u32) -> usize {
+/// Calculates the encoded length in bytes for an [`ArrayCellNonOptional`] with the specified tag.
+///
+/// Returns the number of bytes that would be produced when encoding this array cell in
+/// Protocol Buffer format. Uses packed length calculation for numeric arrays and repeated
+/// length calculation for string-based arrays.
+pub fn array_cell_non_optional_encoded_len_prost(
+    array_cell: ArrayCellNonOptional,
+    tag: u32,
+) -> usize {
     match array_cell {
-        ArrayCell::Null => 0,
-        ArrayCell::Bool(mut vec) => {
-            let vec: Vec<bool> = vec.drain(..).flatten().collect();
-            prost::encoding::bool::encoded_len_packed(tag, &vec)
-        }
-        ArrayCell::String(mut vec) => {
-            let vec: Vec<String> = vec.drain(..).flatten().collect();
+        ArrayCellNonOptional::Null => 0,
+        ArrayCellNonOptional::Bool(vec) => prost::encoding::bool::encoded_len_packed(tag, &vec),
+        ArrayCellNonOptional::String(vec) => {
             prost::encoding::string::encoded_len_repeated(tag, &vec)
         }
-        ArrayCell::I16(mut vec) => {
-            let vec: Vec<i32> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap() as i32)
+        ArrayCellNonOptional::I16(vec) => {
+            let values: Vec<i32> = vec.into_iter().map(|v| v as i32).collect();
+            prost::encoding::int32::encoded_len_packed(tag, &values)
+        }
+        ArrayCellNonOptional::I32(vec) => prost::encoding::int32::encoded_len_packed(tag, &vec),
+        ArrayCellNonOptional::U32(vec) => prost::encoding::uint32::encoded_len_packed(tag, &vec),
+        ArrayCellNonOptional::I64(vec) => prost::encoding::int64::encoded_len_packed(tag, &vec),
+        ArrayCellNonOptional::F32(vec) => prost::encoding::float::encoded_len_packed(tag, &vec),
+        ArrayCellNonOptional::F64(vec) => prost::encoding::double::encoded_len_packed(tag, &vec),
+        ArrayCellNonOptional::Numeric(vec) => {
+            let values: Vec<String> = vec.into_iter().map(|v| v.to_string()).collect();
+            prost::encoding::string::encoded_len_repeated(tag, &values)
+        }
+        ArrayCellNonOptional::Date(vec) => {
+            let values: Vec<String> = vec
+                .into_iter()
+                .map(|v| v.format(DATE_FORMAT).to_string())
                 .collect();
-            prost::encoding::int32::encoded_len_packed(tag, &vec)
+            prost::encoding::string::encoded_len_repeated(tag, &values)
         }
-        ArrayCell::I32(mut vec) => {
-            let vec: Vec<i32> = vec.drain(..).flatten().collect();
-            prost::encoding::int32::encoded_len_packed(tag, &vec)
-        }
-        ArrayCell::U32(mut vec) => {
-            let vec: Vec<u32> = vec.drain(..).flatten().collect();
-            prost::encoding::uint32::encoded_len_packed(tag, &vec)
-        }
-        ArrayCell::I64(mut vec) => {
-            let vec: Vec<i64> = vec.drain(..).flatten().collect();
-            prost::encoding::int64::encoded_len_packed(tag, &vec)
-        }
-        ArrayCell::F32(mut vec) => {
-            let vec: Vec<f32> = vec.drain(..).flatten().collect();
-            prost::encoding::float::encoded_len_packed(tag, &vec)
-        }
-        ArrayCell::F64(mut vec) => {
-            let vec: Vec<f64> = vec.drain(..).flatten().collect();
-            prost::encoding::double::encoded_len_packed(tag, &vec)
-        }
-        ArrayCell::Numeric(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().to_string())
+        ArrayCellNonOptional::Time(vec) => {
+            let values: Vec<String> = vec
+                .into_iter()
+                .map(|v| v.format(TIME_FORMAT).to_string())
                 .collect();
-            prost::encoding::string::encoded_len_repeated(tag, &vec)
+            prost::encoding::string::encoded_len_repeated(tag, &values)
         }
-        ArrayCell::Date(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().format("%Y-%m-%d").to_string())
+        ArrayCellNonOptional::TimeStamp(vec) => {
+            let values: Vec<String> = vec
+                .into_iter()
+                .map(|v| v.format(TIMESTAMP_FORMAT).to_string())
                 .collect();
-            prost::encoding::string::encoded_len_repeated(tag, &vec)
+            prost::encoding::string::encoded_len_repeated(tag, &values)
         }
-        ArrayCell::Time(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().format("%H:%M:%S%.f").to_string())
+        ArrayCellNonOptional::TimeStampTz(vec) => {
+            let values: Vec<String> = vec
+                .into_iter()
+                .map(|v| v.format(TIMESTAMPTZ_FORMAT).to_string())
                 .collect();
-            prost::encoding::string::encoded_len_repeated(tag, &vec)
+            prost::encoding::string::encoded_len_repeated(tag, &values)
         }
-        ArrayCell::TimeStamp(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string())
-                .collect();
-            prost::encoding::string::encoded_len_repeated(tag, &vec)
+        ArrayCellNonOptional::Uuid(vec) => {
+            let values: Vec<String> = vec.into_iter().map(|v| v.to_string()).collect();
+            prost::encoding::string::encoded_len_repeated(tag, &values)
         }
-        ArrayCell::TimeStampTz(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().format("%Y-%m-%d %H:%M:%S%.f%:z").to_string())
-                .collect();
-            prost::encoding::string::encoded_len_repeated(tag, &vec)
+        ArrayCellNonOptional::Json(vec) => {
+            let values: Vec<String> = vec.into_iter().map(|v| v.to_string()).collect();
+            prost::encoding::string::encoded_len_repeated(tag, &values)
         }
-        ArrayCell::Uuid(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().to_string())
-                .collect();
-            prost::encoding::string::encoded_len_repeated(tag, &vec)
-        }
-        ArrayCell::Json(mut vec) => {
-            let vec: Vec<String> = vec
-                .drain(..)
-                .filter(|v| v.is_some())
-                .map(|v| v.unwrap().to_string())
-                .collect();
-            prost::encoding::string::encoded_len_repeated(tag, &vec)
-        }
-        ArrayCell::Bytes(mut vec) => {
-            let vec: Vec<Vec<u8>> = vec.drain(..).flatten().collect();
-            prost::encoding::bytes::encoded_len_repeated(tag, &vec)
-        }
+        ArrayCellNonOptional::Bytes(vec) => prost::encoding::bytes::encoded_len_repeated(tag, &vec),
     }
 }

@@ -1,5 +1,6 @@
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use etl::config::BatchConfig;
+use etl::error::ErrorKind;
 use etl::state::table::TableReplicationPhaseType;
 use etl::test_utils::database::{spawn_source_database, test_table_name};
 use etl::test_utils::notify::NotifyingStore;
@@ -11,6 +12,8 @@ use etl_destinations::bigquery::install_crypto_provider_for_bigquery;
 use etl_telemetry::init_test_tracing;
 use rand::random;
 use std::str::FromStr;
+use std::time::Duration;
+use tokio::time::sleep;
 
 use crate::common::bigquery::{
     BigQueryOrder, BigQueryUser, NonNullableColsScalar, NullableColsArray, NullableColsScalar,
@@ -1473,4 +1476,152 @@ async fn table_non_nullable_array_columns() {
     assert!(table_rows.is_none());
 
     pipeline.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn table_array_with_null_values() {
+    init_test_tracing();
+    install_crypto_provider_for_bigquery();
+
+    let database = spawn_source_database().await;
+    let bigquery_database = setup_bigquery_connection().await;
+    let table_name = test_table_name("array_with_nulls");
+    let table_id = database
+        .create_table(table_name.clone(), true, &[("int_array", "int4[]")])
+        .await
+        .unwrap();
+
+    let store = NotifyingStore::new();
+    let raw_destination = bigquery_database.build_destination(store.clone()).await;
+    let destination = TestDestinationWrapper::wrap(raw_destination);
+
+    let publication_name = "test_pub_array_nulls".to_string();
+    database
+        .create_publication(&publication_name, std::slice::from_ref(&table_name))
+        .await
+        .expect("Failed to create publication");
+
+    let pipeline_id: PipelineId = random();
+    let mut pipeline = create_pipeline(
+        &database.config,
+        pipeline_id,
+        publication_name.clone(),
+        store.clone(),
+        destination.clone(),
+    );
+
+    let table_sync_done_notification = store
+        .notify_on_table_state(table_id, TableReplicationPhaseType::SyncDone)
+        .await;
+
+    pipeline.start().await.unwrap();
+
+    table_sync_done_notification.notified().await;
+
+    // Insert array with null value
+    database
+        .client
+        .as_ref()
+        .unwrap()
+        .execute(
+            &format!(
+                "INSERT INTO {} (int_array) VALUES (ARRAY[1, NULL])",
+                table_name.as_quoted_identifier()
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // We sleep to wait for the event to be processed. This is not ideal, but if we wanted to do
+    // this better, we would have to also implement error handling within the apply worker to write
+    // in the state store.
+    sleep(Duration::from_secs(1)).await;
+
+    // Wait for the pipeline expecting an error to be returned.
+    let err = pipeline.shutdown_and_wait().await.err().unwrap();
+    assert_eq!(err.kinds().len(), 1);
+    assert_eq!(err.kinds()[0], ErrorKind::NullValuesNotSupportedInArray);
+
+    // Reset and try with valid array (no nulls)
+    database
+        .client
+        .as_ref()
+        .unwrap()
+        .execute(
+            &format!(
+                "DELETE FROM {} WHERE true",
+                table_name.as_quoted_identifier()
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // We have to reset the state of the table and copy it from scratch, otherwise the CDC will contain
+    // the inserts and deletes, failing again.
+    store.reset_table_state(table_id).await.unwrap();
+    // We also clear the events so that it's more idiomatic to wait for them, since we don't have
+    // the insert of before.
+    destination.clear_events().await;
+
+    // We recreate the pipeline and try again.
+    let mut pipeline = create_pipeline(
+        &database.config,
+        pipeline_id,
+        publication_name,
+        store.clone(),
+        destination.clone(),
+    );
+
+    let table_sync_done_notification = store
+        .notify_on_table_state(table_id, TableReplicationPhaseType::SyncDone)
+        .await;
+
+    pipeline.start().await.unwrap();
+
+    table_sync_done_notification.notified().await;
+
+    let event_notify = destination
+        .wait_for_events_count(vec![(EventType::Insert, 1)])
+        .await;
+
+    // Insert array without null values
+    database
+        .client
+        .as_ref()
+        .unwrap()
+        .execute(
+            &format!(
+                "INSERT INTO {} (int_array) VALUES (ARRAY[1, 2, 3])",
+                table_name.as_quoted_identifier()
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    event_notify.notified().await;
+
+    pipeline.shutdown_and_wait().await.unwrap();
+
+    // Verify the valid array was successfully replicated to BigQuery
+    let table_rows = bigquery_database
+        .query_table(table_name.clone())
+        .await
+        .unwrap();
+
+    // Check that there is only the valid row in BigQuery
+    assert_eq!(table_rows.len(), 1);
+
+    // Check that the int array contains 3 elements, meaning it must be the second insert with all
+    // NON-NULL values
+    let row = &table_rows[0];
+    if let Some(columns) = &row.columns {
+        assert_eq!(columns.len(), 2);
+        assert_eq!(
+            columns[1].value.clone().unwrap().as_array().unwrap().len(),
+            3
+        );
+    }
 }

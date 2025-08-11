@@ -110,6 +110,11 @@ impl<D> TestDestinationWrapper<D> {
         self.notify_on_events(move |events| check_events_count(events, conditions.clone()))
             .await
     }
+
+    pub async fn clear_events(&self) {
+        let mut inner = self.inner.write().await;
+        inner.events.clear();
+    }
 }
 
 impl<D: Destination + Send + Sync + Clone> Destination for TestDestinationWrapper<D> {
