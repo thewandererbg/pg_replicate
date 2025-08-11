@@ -77,6 +77,17 @@ struct Inner<S> {
     /// Cache of table IDs that have been successfully created or verified to exist.
     /// This avoids redundant `create_table_if_missing` calls for known tables.
     created_tables: HashSet<BigQueryTableId>,
+    /// Tracks the current version number for each table to support truncation.
+    /// Maps base table name to its current version number (e.g., "schema_table" -> 2).
+    // TODO: add mapping in the store.
+    table_versions: HashMap<BigQueryTableId, u32>,
+    /// Cache of views that have been created and the versioned table they point to.
+    /// This avoids redundant `CREATE OR REPLACE VIEW` calls for views that already point to the correct table.
+    /// Maps view name to the versioned table it currently points to.
+    ///
+    /// # Example
+    /// `{ users_table: users_table_10, orders_table: orders_table_3 }`
+    created_views: HashMap<BigQueryTableId, BigQueryTableId>,
 }
 
 /// A BigQuery destination that implements the ETL [`Destination`] trait.
@@ -110,6 +121,8 @@ where
             max_staleness_mins,
             schema_store,
             created_tables: HashSet::new(),
+            table_versions: HashMap::new(),
+            created_views: HashMap::new(),
         };
 
         Ok(Self {
@@ -135,6 +148,8 @@ where
             max_staleness_mins,
             schema_store,
             created_tables: HashSet::new(),
+            table_versions: HashMap::new(),
+            created_views: HashMap::new(),
         };
 
         Ok(Self {
@@ -168,34 +183,40 @@ where
                 )
             })?;
 
-        let table_id = table_name_to_bigquery_table_id(&table_schema.name);
+        let base_table_id = table_name_to_bigquery_table_id(&table_schema.name);
+        let versioned_table_id = Self::get_versioned_table_name(inner, &base_table_id);
 
-        // Optimistically skip table creation if we've already seen this table
-        if !inner.created_tables.contains(&table_id) {
+        // Optimistically skip table creation if we've already seen this versioned table
+        if !inner.created_tables.contains(&versioned_table_id) {
             inner
                 .client
                 .create_table_if_missing(
                     &inner.dataset_id,
-                    &table_id,
+                    &versioned_table_id,
                     &table_schema.column_schemas,
                     inner.max_staleness_mins,
                 )
                 .await?;
 
-            // Add the table to the cache (with random eviction if needed)
-            Self::add_to_created_tables_cache(inner, table_id.clone());
+            // Add the versioned table to the cache
+            Self::add_to_created_tables_cache(inner, versioned_table_id.clone());
 
-            debug!("table {table_id} added to creation cache");
+            debug!("versioned table {versioned_table_id} added to creation cache");
         } else {
-            debug!("table {table_id} found in creation cache, skipping existence check");
+            debug!(
+                "versioned table {versioned_table_id} found in creation cache, skipping existence check"
+            );
         }
+
+        // Ensure view points to this versioned table (uses cache to avoid redundant operations)
+        Self::ensure_view_points_to_table(inner, &base_table_id, &versioned_table_id).await?;
 
         let table_descriptor = BigQueryClient::column_schemas_to_table_descriptor(
             &table_schema.column_schemas,
             use_cdc_sequence_column,
         );
 
-        Ok((table_id, table_descriptor))
+        Ok((versioned_table_id, table_descriptor))
     }
 
     /// Adds a table ID to the created tables cache if not present.
@@ -215,6 +236,90 @@ where
         table_id: &BigQueryTableId,
     ) {
         inner.created_tables.remove(table_id);
+    }
+
+    /// Returns the versioned table name for the current version of a base table.
+    ///
+    /// If no version exists for the table, initializes it to version 0.
+    fn get_versioned_table_name(
+        inner: &mut Inner<impl SchemaStore>,
+        base_table_id: &BigQueryTableId,
+    ) -> BigQueryTableId {
+        let version = inner
+            .table_versions
+            .entry(base_table_id.clone())
+            .or_insert(0);
+        format!("{base_table_id}_{version}")
+    }
+
+    /// Returns the previous versioned table name for cleanup purposes.
+    fn get_previous_versioned_table_name(
+        inner: &Inner<impl SchemaStore>,
+        base_table_id: &BigQueryTableId,
+    ) -> Option<BigQueryTableId> {
+        inner
+            .table_versions
+            .get(base_table_id)
+            .and_then(|&version| {
+                if version > 0 {
+                    Some(format!("{}_{}", base_table_id, version - 1))
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Increments the version for a table and returns the new versioned table name.
+    fn increment_table_version(
+        inner: &mut Inner<impl SchemaStore>,
+        base_table_id: &BigQueryTableId,
+    ) -> BigQueryTableId {
+        let version = inner
+            .table_versions
+            .entry(base_table_id.clone())
+            .or_insert(0);
+        *version += 1;
+
+        format!("{base_table_id}_{version}")
+    }
+
+    /// Checks if a view needs to be created or updated and performs the operation if needed.
+    ///
+    /// Returns `true` if the view was created/updated, `false` if it was already pointing to the correct table.
+    async fn ensure_view_points_to_table(
+        inner: &mut Inner<impl SchemaStore>,
+        view_name: &BigQueryTableId,
+        target_table_id: &BigQueryTableId,
+    ) -> EtlResult<bool> {
+        // Check if the view already points to the correct table
+        if let Some(current_target) = inner.created_views.get(view_name)
+            && current_target == target_table_id
+        {
+            debug!(
+                "view {} already points to {}, skipping creation",
+                view_name, target_table_id
+            );
+
+            return Ok(false);
+        }
+
+        // Create or replace the view
+        inner
+            .client
+            .create_or_replace_view(&inner.dataset_id, view_name, target_table_id)
+            .await?;
+
+        // Update cache
+        inner
+            .created_views
+            .insert(view_name.clone(), target_table_id.clone());
+
+        debug!(
+            "view {} created/updated to point to {}",
+            view_name, target_table_id
+        );
+
+        Ok(true)
     }
 
     /// Handles streaming rows with fallback table creation on missing table errors.
@@ -319,7 +424,7 @@ where
             let mut table_id_to_table_rows = HashMap::new();
             let mut truncate_events = Vec::new();
 
-            // Process events until we hit a truncate or run out of events
+            // Process events until we hit a truncate event or run out of events
             while let Some(event) = event_iter.peek() {
                 if matches!(event, Event::Truncate(_)) {
                     break;
@@ -408,46 +513,109 @@ where
 
             // Process truncate events
             if !truncate_events.is_empty() {
-                // Right now we are not processing truncate messages, but we do the streaming split
-                // just to try out if splitting the streaming affects performance so that we might
-                // need it down the line once we figure out a solution for truncation.
-                warn!(
-                    "'TRUNCATE' events are not supported, skipping apply of {} 'TRUNCATE' events",
+                info!(
+                    "Processing {} 'TRUNCATE' events with versioned table recreation",
                     truncate_events.len()
                 );
+                self.process_truncate_events(truncate_events).await?;
             }
         }
 
         Ok(())
     }
 
-    /// Processes truncate events by executing `TRUNCATE TABLE` statements in BigQuery.
+    /// Processes truncate events by creating new versioned tables and updating views.
     ///
-    /// Maps PostgreSQL table OIDs to BigQuery table names and issues truncate commands.
-    #[allow(dead_code)]
+    /// Maps PostgreSQL table OIDs to BigQuery table names, creates new versioned tables,
+    /// updates views to point to new tables, and schedules old table cleanup.
+    /// Deduplicates table IDs to avoid redundant truncate operations on the same table.
     async fn process_truncate_events(&self, truncate_events: Vec<TruncateEvent>) -> EtlResult<()> {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
 
+        // Collect and deduplicate all table IDs from all truncate events.
+        //
+        // This is done as an optimization since if we have multiple table ids being truncated in a
+        // row without applying other events in the meanwhile, it doesn't make any sense to create
+        // new empty tables for each of them.
+        let mut unique_table_ids = HashSet::new();
         for truncate_event in truncate_events {
             for table_id in truncate_event.rel_ids {
-                if let Some(table_schema) = inner
-                    .schema_store
-                    .get_table_schema(&TableId::new(table_id))
-                    .await?
-                {
-                    inner
-                        .client
-                        .truncate_table(
-                            &inner.dataset_id,
-                            &table_name_to_bigquery_table_id(&table_schema.name),
-                        )
-                        .await?;
-                } else {
-                    info!(
-                        "table schema not found for table_id: {}, skipping truncate",
-                        table_id
-                    );
-                }
+                unique_table_ids.insert(table_id);
+            }
+        }
+
+        for table_id in unique_table_ids {
+            let Some(table_schema) = inner
+                .schema_store
+                .get_table_schema(&TableId::new(table_id))
+                .await?
+            else {
+                info!(
+                    "table schema not found for table_id: {}, skipping truncate",
+                    table_id
+                );
+                continue;
+            };
+
+            let base_table_id = table_name_to_bigquery_table_id(&table_schema.name);
+
+            // Get the previous table name for cleanup
+            let previous_table_id = Self::get_previous_versioned_table_name(&inner, &base_table_id);
+
+            // Create the new versioned table
+            let new_versioned_table_id = Self::increment_table_version(&mut inner, &base_table_id);
+
+            info!(
+                "processing truncate for table {}: creating new version {}",
+                base_table_id, new_versioned_table_id
+            );
+
+            // Create or replace the new table.
+            //
+            // We unconditionally replace the table if it's there because here we know that
+            // we need the table to be empty given the truncation.
+            inner
+                .client
+                .create_or_replace_table(
+                    &inner.dataset_id,
+                    &new_versioned_table_id,
+                    &table_schema.column_schemas,
+                    inner.max_staleness_mins,
+                )
+                .await?;
+
+            // Update the view to point to the new table.
+            //
+            // We do this after the table has been created to that in case of failure, the
+            // view can be manually updated to point to the new table.
+            //
+            // Unfortunately, BigQuery doesn't seem to offer transactions for DDL operations so our
+            // implementation is best effort.
+            Self::ensure_view_points_to_table(&mut inner, &base_table_id, &new_versioned_table_id)
+                .await?;
+            Self::add_to_created_tables_cache(&mut inner, new_versioned_table_id.clone());
+
+            info!(
+                "successfully processed truncate for {}: new table {}, view updated",
+                base_table_id, new_versioned_table_id
+            );
+
+            if let Some(prev_table_id) = previous_table_id {
+                Self::remove_from_created_tables_cache(&mut inner, &prev_table_id);
+
+                let client = inner.client.clone();
+                let dataset_id = inner.dataset_id.clone();
+
+                // Schedule cleanup of the previous table. We do not care to track this task since
+                // if it fails, users can clean up the table on their own, but the view will still point
+                // to the new data.
+                tokio::spawn(async move {
+                    if let Err(err) = client.drop_table(&dataset_id, &prev_table_id).await {
+                        warn!("failed to drop previous table {}: {}", prev_table_id, err);
+                    } else {
+                        info!("successfully cleaned up previous table {}", prev_table_id);
+                    }
+                });
             }
         }
 

@@ -368,10 +368,7 @@ async fn table_subsequent_updates() {
     assert_eq!(parsed_users_rows, vec![BigQueryUser::new(1, "user_2", 2),]);
 }
 
-// This test is disabled since truncation is currently not supported by BigQuery when doing CDC
-// streaming. The test is kept just for future use.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn table_truncate_with_batching() {
     init_test_tracing();
     install_crypto_provider_for_bigquery();
@@ -380,6 +377,12 @@ async fn table_truncate_with_batching() {
     let database_schema = setup_test_database_schema(&database, TableSelection::Both).await;
 
     let bigquery_database = setup_bigquery_connection().await;
+
+    // We create table `test_users_1` to simulate an error in the system where a table with that name
+    // already exists and should be replaced for replication to work correctly.
+    bigquery_database
+        .create_table("test_users_1", &[("age", "integer")])
+        .await;
 
     let store = NotifyingStore::new();
     let raw_destination = bigquery_database.build_destination(store.clone()).await;
@@ -420,17 +423,17 @@ async fn table_truncate_with_batching() {
     users_state_notify.notified().await;
     orders_state_notify.notified().await;
 
-    // Wait for the 4 inserts (2 per table) and 2 truncates (one per table).
+    // Wait for the 8 inserts (4 per table + 4 after truncate) and 2 truncates (1 per table).
     let event_notify = destination
-        .wait_for_events_count(vec![(EventType::Insert, 4), (EventType::Truncate, 2)])
+        .wait_for_events_count(vec![(EventType::Insert, 8), (EventType::Truncate, 2)])
         .await;
 
-    // Insert 1 row per each table.
+    // Insert 2 rows per each table.
     insert_mock_data(
         &mut database,
         &database_schema.users_schema().name,
         &database_schema.orders_schema().name,
-        1..=1,
+        1..=2,
         false,
     )
     .await;
@@ -445,12 +448,12 @@ async fn table_truncate_with_batching() {
         .await
         .unwrap();
 
-    // Insert 1 extra row per each table.
+    // Insert 2 extra rows per each table.
     insert_mock_data(
         &mut database,
         &database_schema.users_schema().name,
         &database_schema.orders_schema().name,
-        2..=2,
+        3..=4,
         false,
     )
     .await;
@@ -459,14 +462,20 @@ async fn table_truncate_with_batching() {
 
     pipeline.shutdown_and_wait().await.unwrap();
 
-    // We query BigQuery directly to get the data which has been inserted by tests expecting that
+    // We query BigQuery directly to get the data which tests have inserted, expecting that
     // only the rows after truncation are there.
     let users_rows = bigquery_database
         .query_table(database_schema.users_schema().name)
         .await
         .unwrap();
     let parsed_users_rows = parse_bigquery_table_rows::<BigQueryUser>(users_rows);
-    assert_eq!(parsed_users_rows, vec![BigQueryUser::new(2, "user_2", 2),]);
+    assert_eq!(
+        parsed_users_rows,
+        vec![
+            BigQueryUser::new(3, "user_3", 3),
+            BigQueryUser::new(4, "user_4", 4),
+        ]
+    );
     let orders_rows = bigquery_database
         .query_table(database_schema.orders_schema().name)
         .await
@@ -474,7 +483,10 @@ async fn table_truncate_with_batching() {
     let parsed_orders_rows = parse_bigquery_table_rows::<BigQueryOrder>(orders_rows);
     assert_eq!(
         parsed_orders_rows,
-        vec![BigQueryOrder::new(2, "description_2"),]
+        vec![
+            BigQueryOrder::new(3, "description_3"),
+            BigQueryOrder::new(4, "description_4")
+        ]
     );
 }
 
