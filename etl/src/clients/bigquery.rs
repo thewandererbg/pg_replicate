@@ -195,13 +195,13 @@ impl BigQueryClient {
         }
     }
 
-    fn partition_option(column_schemas: &[ColumnSchema]) -> String {
-        if column_schemas.iter().any(|col| col.name == "created_at") {
-            "partition by date(created_at)".to_string()
-        } else {
-            "".to_string()
-        }
-    }
+    // fn partition_option(column_schemas: &[ColumnSchema]) -> String {
+    //     if column_schemas.iter().any(|col| col.name == "created_at") {
+    //         "partition by date(created_at)".to_string()
+    //     } else {
+    //         "".to_string()
+    //     }
+    // }
 
     pub async fn create_table(
         &self,
@@ -731,8 +731,11 @@ impl BigQueryClient {
 
         // 40MB is the minimum bytes billed for any partition replacement.
         // Stream directly into table if it's lower than 40MB
-        if partition_type == "NONE" || partition_column == "" || streaming_buffer || has_deletes
-        // || num_bytes < 40 * 1024 * 1024
+        if partition_type == "NONE"
+            || partition_column == ""
+            || streaming_buffer
+            || has_deletes
+            || num_bytes < 40 * 1024 * 1024
         {
             info!("Streaming rows into {}", base_table);
             self.stream_rows(dataset_id, base_table, table_descriptor, update_rows)
