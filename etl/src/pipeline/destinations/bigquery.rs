@@ -120,7 +120,7 @@ impl BatchDestination for BigQueryBatchDestination {
                 &self.dataset_id,
                 "_copied_tables",
                 &copied_table_column_schemas,
-                self.max_staleness_mins,
+                0,
             )
             .await?;
 
@@ -142,12 +142,7 @@ impl BatchDestination for BigQueryBatchDestination {
         ];
         if self
             .client
-            .create_table_if_missing(
-                &self.dataset_id,
-                "_last_lsn",
-                &last_lsn_column_schemas,
-                self.max_staleness_mins,
-            )
+            .create_table_if_missing(&self.dataset_id, "_last_lsn", &last_lsn_column_schemas, 0)
             .await?
         {
             self.client.insert_last_lsn_row(&self.dataset_id).await?;

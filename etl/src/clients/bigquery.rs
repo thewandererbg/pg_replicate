@@ -212,7 +212,8 @@ impl BigQueryClient {
     ) -> Result<(), BQError> {
         let columns_spec = Self::create_columns_spec(column_schemas);
         let max_staleness_option = Self::max_staleness_option(max_staleness_mins);
-        let partition_option = Self::partition_option(column_schemas);
+        // let partition_option = Self::partition_option(column_schemas);
+        let partition_option = "".to_string();
         let project_id = &self.project_id;
         info!("creating table {project_id}.{dataset_id}.{table_name} in bigquery");
         let query =
