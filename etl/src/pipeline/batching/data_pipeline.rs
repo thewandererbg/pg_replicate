@@ -164,9 +164,9 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
         );
         pin!(batch_timeout_stream);
 
-        // Ping the postgresql database each 5s to keep connection alive
+        // Ping the postgresql database each 10s to keep connection alive
         // in case wal_sender_timeout < max_batch_fill_time
-        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut current_lsn = last_lsn.into();
 
@@ -187,13 +187,33 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                                 let event = event.map_err(CommonSourceError::CdcStream)?;
                                 events.push(event);
                             }
-                            let last_lsn = self
-                                .destination
-                                .write_cdc_events(events)
-                                .await
-                                .map_err(PipelineError::Destination)?;
+
+                            // Wrap write operation with ping mechanism to prevent timeout during long writes
+                            let write_future = self.destination.write_cdc_events(events);
+                            pin!(write_future);
+
+                            let mut write_ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                            write_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                            let last_lsn = loop {
+                                tokio::select! {
+                                    result = &mut write_future => {
+                                        break result.map_err(PipelineError::Destination)?;
+                                    }
+                                    _ = write_ping_interval.tick() => {
+                                        // Send ping with current LSN to keep connection alive during write
+                                        let inner = unsafe {
+                                            batch_timeout_stream
+                                                .as_mut()
+                                                .get_unchecked_mut()
+                                                .get_inner_mut()
+                                        };
+                                        let _ = inner.as_mut().send_status_update(current_lsn).await;
+                                    }
+                                }
+                            };
+
                             current_lsn = last_lsn;
-                            info!("sending status update with lsn: {last_lsn}");
                             let inner = unsafe {
                                 batch_timeout_stream
                                     .as_mut()
@@ -219,7 +239,7 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                     }
                 }
                 _ = ping_interval.tick() => {
-                    // info!("ping server with lsn: {current_lsn}");
+                    // Send ping with current LSN to keep connection alive during waiting
                     let inner = unsafe {
                         batch_timeout_stream
                             .as_mut()
