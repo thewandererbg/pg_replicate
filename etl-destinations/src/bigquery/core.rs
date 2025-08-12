@@ -104,7 +104,7 @@ impl FromStr for SequencedBigQueryTableId {
 
             if table_name.is_empty() {
                 bail!(
-                    ErrorKind::InvalidTableName,
+                    ErrorKind::DestinationTableNameInvalid,
                     "Invalid sequenced BigQuery table ID format",
                     format!(
                         "Table name cannot be empty in sequenced table ID '{table_id}'. Expected format: 'table_name_sequence'"
@@ -114,7 +114,7 @@ impl FromStr for SequencedBigQueryTableId {
 
             if sequence_str.is_empty() {
                 bail!(
-                    ErrorKind::InvalidTableName,
+                    ErrorKind::DestinationTableNameInvalid,
                     "Invalid sequenced BigQuery table ID format",
                     format!(
                         "Sequence number cannot be empty in sequenced table ID '{table_id}'. Expected format: 'table_name_sequence'"
@@ -126,7 +126,7 @@ impl FromStr for SequencedBigQueryTableId {
                 .parse::<u64>()
                 .map_err(|e| {
                     etl_error!(
-                        ErrorKind::InvalidTableName,
+                        ErrorKind::DestinationTableNameInvalid,
                         "Invalid sequence number in BigQuery table ID",
                         format!(
                             "Failed to parse sequence number '{sequence_str}' in table ID '{table_id}': {e}. Expected a non-negative integer (0-{max})",
@@ -141,7 +141,7 @@ impl FromStr for SequencedBigQueryTableId {
             ))
         } else {
             bail!(
-                ErrorKind::InvalidTableName,
+                ErrorKind::DestinationTableNameInvalid,
                 "Invalid sequenced BigQuery table ID format",
                 format!(
                     "No underscore found in table ID '{table_id}'. Expected format: 'table_name_sequence' where sequence is a non-negative integer"
@@ -950,7 +950,7 @@ mod tests {
         assert!(result.is_err());
 
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidTableName);
+        assert_eq!(err.kind(), ErrorKind::DestinationTableNameInvalid);
         assert!(err.to_string().contains("No underscore found"));
         assert!(err.to_string().contains("tablewithoutsequence"));
         assert!(
@@ -965,7 +965,7 @@ mod tests {
         assert!(result.is_err());
 
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidTableName);
+        assert_eq!(err.kind(), ErrorKind::DestinationTableNameInvalid);
         assert!(err.to_string().contains("Failed to parse sequence number"));
         assert!(err.to_string().contains("not_a_number"));
         assert!(err.to_string().contains("users_table_not_a_number"));
@@ -978,7 +978,7 @@ mod tests {
         assert!(result.is_err());
 
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidTableName);
+        assert_eq!(err.kind(), ErrorKind::DestinationTableNameInvalid);
         assert!(err.to_string().contains("Failed to parse sequence number"));
         assert!(err.to_string().contains("word"));
         assert!(err.to_string().contains("table_word"));
@@ -991,7 +991,7 @@ mod tests {
         assert!(result.is_err());
 
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidTableName);
+        assert_eq!(err.kind(), ErrorKind::DestinationTableNameInvalid);
         assert!(err.to_string().contains("Failed to parse sequence number"));
         assert!(err.to_string().contains("-123"));
         assert!(err.to_string().contains("users_table_-123"));
@@ -1003,7 +1003,7 @@ mod tests {
         assert!(result.is_err());
 
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidTableName);
+        assert_eq!(err.kind(), ErrorKind::DestinationTableNameInvalid);
         assert!(err.to_string().contains("Failed to parse sequence number"));
         assert!(err.to_string().contains("18446744073709551616"));
         assert!(err.to_string().contains("users_table_18446744073709551616"));
@@ -1015,7 +1015,7 @@ mod tests {
         assert!(result.is_err());
 
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidTableName);
+        assert_eq!(err.kind(), ErrorKind::DestinationTableNameInvalid);
         assert!(err.to_string().contains("No underscore found"));
         assert!(err.to_string().contains("''"));
         assert!(
@@ -1030,7 +1030,7 @@ mod tests {
         assert!(result.is_err());
 
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidTableName);
+        assert_eq!(err.kind(), ErrorKind::DestinationTableNameInvalid);
         assert!(err.to_string().contains("Sequence number cannot be empty"));
         assert!(err.to_string().contains("users_table_"));
         assert!(
@@ -1045,7 +1045,7 @@ mod tests {
         assert!(result.is_err());
 
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidTableName);
+        assert_eq!(err.kind(), ErrorKind::DestinationTableNameInvalid);
         assert!(err.to_string().contains("Table name cannot be empty"));
         assert!(err.to_string().contains("_123"));
         assert!(
