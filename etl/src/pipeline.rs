@@ -52,7 +52,6 @@ enum PipelineState {
 /// apply worker processes the replication stream of table that were already copied.
 #[derive(Debug)]
 pub struct Pipeline<S, D> {
-    id: PipelineId,
     config: Arc<PipelineConfig>,
     store: S,
     destination: D,
@@ -69,8 +68,10 @@ where
     ///
     /// The pipeline is initially in the not-started state and must be
     /// explicitly started using [`Pipeline::start`]. The state store is used for tracking
-    /// replication progress and table schemas, while the destination receives replicated data.
-    pub fn new(id: PipelineId, config: PipelineConfig, state_store: S, destination: D) -> Self {
+    /// replication progress, table schemas, and table mappings, while the destination receives replicated data.
+    /// The pipeline ID is extracted from the configuration, ensuring consistency between
+    /// pipeline identity and configuration settings.
+    pub fn new(config: PipelineConfig, state_store: S, destination: D) -> Self {
         // We create a watch channel of unit types since this is just used to notify all subscribers
         // that shutdown is needed.
         //
@@ -79,7 +80,6 @@ where
         let (shutdown_tx, _) = create_shutdown_channel();
 
         Self {
-            id,
             config: Arc::new(config),
             store: state_store,
             destination,
@@ -90,7 +90,7 @@ where
 
     /// Returns the unique identifier for this pipeline.
     pub fn id(&self) -> PipelineId {
-        self.id
+        self.config.id
     }
 
     /// Returns a handle for sending shutdown signals to this pipeline.
@@ -110,7 +110,7 @@ where
     pub async fn start(&mut self) -> EtlResult<()> {
         info!(
             "starting pipeline for publication '{}' with id {}",
-            self.config.publication_name, self.id
+            self.config.publication_name, self.config.id
         );
 
         // We create the first connection to Postgres.
@@ -141,7 +141,7 @@ where
         // We create and start the apply worker (temporarily leaving out retries_orchestrator)
         // TODO: Remove retries_orchestrator from ApplyWorker constructor
         let apply_worker = ApplyWorker::new(
-            self.id,
+            self.config.id,
             self.config.clone(),
             replication_client,
             pool.clone(),
