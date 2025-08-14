@@ -13,18 +13,22 @@ use crate::store::state::StateStore;
 use crate::workers::base::{Worker, WorkerHandle};
 use crate::workers::table_sync::{TableSyncWorker, TableSyncWorkerHandle, TableSyncWorkerState};
 
+/// Internal state for [`TableSyncWorkerPool`].
 #[derive(Debug)]
 pub struct TableSyncWorkerPoolInner {
-    /// The table sync workers that are currently active.
+    /// Currently active table sync workers indexed by table ID.
     active: HashMap<TableId, TableSyncWorkerHandle>,
-    /// The table sync workers that are finished, meaning that either they completed or errored.
+    /// Completed or failed table sync workers, preserving history for inspection.
     finished: HashMap<TableId, Vec<TableSyncWorkerHandle>>,
-    /// A [`Notify`] instance which notifies subscribers when there is a change in the pool (e.g.
-    /// a new worker changes from active to inactive).
+    /// Notification mechanism for pool state changes.
     pool_update: Option<Arc<Notify>>,
 }
 
 impl TableSyncWorkerPoolInner {
+    /// Creates a new empty table sync worker pool inner state.
+    ///
+    /// This constructor initializes the pool with empty collections for active
+    /// and finished workers, with no notification mechanism initially configured.
     fn new() -> Self {
         Self {
             active: HashMap::new(),
@@ -33,6 +37,14 @@ impl TableSyncWorkerPoolInner {
         }
     }
 
+    /// Starts a new table sync worker and adds it to the active worker pool.
+    ///
+    /// This method initiates the worker's synchronization process and tracks it
+    /// in the pool. If a worker for the same table already exists, the operation
+    /// is skipped to prevent conflicts.
+    ///
+    /// Returns `Ok(true)` if the worker was successfully started, `Ok(false)` if
+    /// a worker for the table already exists.
     pub async fn start_worker<S, D>(&mut self, worker: TableSyncWorker<S, D>) -> EtlResult<bool>
     where
         S: StateStore + SchemaStore + Clone + Send + Sync + 'static,
@@ -55,6 +67,11 @@ impl TableSyncWorkerPoolInner {
         Ok(true)
     }
 
+    /// Marks a worker as finished and moves it from active to finished state.
+    ///
+    /// This method handles worker completion by transferring the worker handle
+    /// from the active pool to the finished pool. It also notifies any waiting processes
+    /// about the pool state change.
     pub fn mark_worker_finished(&mut self, table_id: TableId) {
         let removed_worker = self.active.remove(&table_id);
 
@@ -70,6 +87,11 @@ impl TableSyncWorkerPoolInner {
         }
     }
 
+    /// Retrieves the state handle for an active worker by table ID.
+    ///
+    /// This method provides access to the state management structure of an
+    /// active worker, enabling coordination and monitoring of the worker's
+    /// synchronization progress.
     pub fn get_active_worker_state(&self, table_id: TableId) -> Option<TableSyncWorkerState> {
         let state = self.active.get(&table_id)?.state().clone();
 
@@ -78,6 +100,15 @@ impl TableSyncWorkerPoolInner {
         Some(state)
     }
 
+    /// Waits for all workers to complete or returns a notification for active workers.
+    ///
+    /// This method implements a non-blocking wait strategy for worker completion.
+    /// If active workers remain, it returns a notification handle that callers can
+    /// use to wait for state changes. If all workers are finished, it processes
+    /// their results and reports any errors.
+    ///
+    /// Returns `Ok(Some(notify))` when active workers remain, `Ok(None)` when all
+    /// workers have completed successfully, or an error if any worker failed.
     pub async fn wait_all(&mut self) -> EtlResult<Option<Arc<Notify>>> {
         // If there are active workers, we return the notify, signaling that not all of them are
         // ready.
@@ -111,18 +142,33 @@ impl TableSyncWorkerPoolInner {
     }
 }
 
+/// Pool for managing multiple table synchronization workers.
+///
+/// [`TableSyncWorkerPool`] coordinates the execution of multiple table sync workers
+/// that run in parallel during the initial synchronization phase of ETL pipelines.
+/// It provides methods for spawning workers, tracking their progress, and waiting
+/// for completion of all synchronization operations.
 #[derive(Debug, Clone)]
 pub struct TableSyncWorkerPool {
     inner: Arc<Mutex<TableSyncWorkerPoolInner>>,
 }
 
 impl TableSyncWorkerPool {
+    /// Creates a new empty table sync worker pool.
+    ///
+    /// The pool starts with no active workers and can accept new workers
+    /// as tables need to be synchronized.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(TableSyncWorkerPoolInner::new())),
         }
     }
 
+    /// Waits for all active table sync workers to complete.
+    ///
+    /// This method blocks until all workers in the pool have finished their
+    /// synchronization tasks. If any workers encounter errors, those errors
+    /// are collected and returned.
     pub async fn wait_all(&self) -> EtlResult<()> {
         loop {
             // We try first to wait for all workers to be finished, in case there are still active

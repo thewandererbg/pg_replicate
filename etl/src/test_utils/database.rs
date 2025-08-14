@@ -23,16 +23,17 @@ pub fn test_table_name(name: &str) -> TableName {
     }
 }
 
-/// Returns the [`PgConnectionConfig`] parameters to connect to the local instance of Postgres.
+/// Generates PostgreSQL connection configuration for isolated test databases.
 ///
-/// If you fail to connect locally to the Postgres instance you can modify this connection struct
-/// with your parameters.
+/// This function creates connection parameters for a local PostgreSQL instance with
+/// test-specific settings designed for isolation, reproducibility, and ease of debugging.
+/// Each invocation creates a unique database name to prevent test interference.
 fn local_pg_connection_config() -> PgConnectionConfig {
     // TODO: make this configurable via env variables.
     PgConnectionConfig {
         host: "localhost".to_owned(),
         port: 5430,
-        // We create a random database name to avoid conflicts with existing databases.
+        // Generate unique database name for test isolation
         name: Uuid::new_v4().to_string(),
         username: "postgres".to_owned(),
         password: Some("postgres".to_owned().into()),

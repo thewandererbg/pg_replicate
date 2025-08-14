@@ -1,8 +1,9 @@
-//! Common utilities and helpers for testing PostgreSQL replication functionality.
+//! Testing utilities for PostgreSQL logical replication systems.
 //!
-//! This module provides shared testing infrastructure including database management,
-//! pipeline testing utilities, destination testing helpers, and table manipulation utilities.
-//! It also includes common testing patterns like waiting for conditions to be met.
+//! Provides a complete testing framework for complex ETL scenarios involving PostgreSQL logical replication,
+//! multiple workers, and various destination systems. Handles test database setup, replication slot management,
+//! worker lifecycle coordination, and data consistency validation.
+
 pub mod database;
 pub mod event;
 pub mod materialize;

@@ -49,16 +49,36 @@ impl<'a> TableCopyStream<'a> {
 impl<'a> Stream for TableCopyStream<'a> {
     type Item = EtlResult<TableRow>;
 
+    /// Polls the stream for the next converted table row with comprehensive error handling.
+    ///
+    /// This method handles the complex process of converting raw PostgreSQL COPY data into
+    /// structured [`TableRow`] objects, with detailed error reporting for various failure modes.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
         match ready!(this.stream.poll_next(cx)) {
             // TODO: allow pluggable table row conversion based on if the data is in text or binary format.
-            Some(Ok(row)) => match TableRowConverter::try_from(&row, this.column_schemas) {
-                Ok(row) => Poll::Ready(Some(Ok(row))),
-                Err(err) => Poll::Ready(Some(Err(err))),
-            },
-            Some(Err(err)) => Poll::Ready(Some(Err(err.into()))),
-            None => Poll::Ready(None),
+            Some(Ok(row)) => {
+                // CONVERSION PHASE: Transform raw bytes into structured TableRow
+                // This is where most errors occur due to data format or type issues
+                match TableRowConverter::try_from(&row, this.column_schemas) {
+                    Ok(row) => Poll::Ready(Some(Ok(row))),
+                    Err(err) => {
+                        // CONVERSION ERROR: Preserve full error context for debugging
+                        // These errors typically indicate schema mismatches or data corruption
+                        Poll::Ready(Some(Err(err)))
+                    }
+                }
+            }
+            Some(Err(err)) => {
+                // PROTOCOL ERROR: PostgreSQL connection or protocol-level failure
+                // Convert tokio-postgres errors to ETL errors with additional context
+                Poll::Ready(Some(Err(err.into())))
+            }
+            None => {
+                // STREAM END: Normal completion - no more rows available
+                // This is the success termination condition for table copying
+                Poll::Ready(None)
+            }
         }
     }
 }
@@ -84,15 +104,11 @@ impl EventsStream {
         }
     }
 
-    /// Sends a status update to the PostgreSQL server with the current replication position.
+    /// Sends a status update to the PostgreSQL server.
     ///
-    /// The timestamp is calculated relative to the PostgreSQL epoch (2000-01-01 00:00:00 UTC).
-    /// This is used to inform the server about the client's progress in processing replication events.
-    ///
-    /// The update will be sent if:
-    /// - force is true, OR
-    /// - The write_lsn or apply_lsn has changed from the last update, OR
-    /// - It has been more than 100ms since the last update
+    /// This method implements a status update logic that balances PostgreSQL's need for
+    /// progress information with network efficiency and system performance. It handles multiple
+    /// error scenarios and edge cases related to time synchronization and network communication.
     pub async fn send_status_update(
         self: Pin<&mut Self>,
         write_lsn: PgLsn,

@@ -14,29 +14,56 @@ pub mod numeric;
 pub mod table_row;
 pub mod text;
 
+/// Represents a single database cell value with support for PostgreSQL types.
+///
+/// [`Cell`] is the primary data container for individual values during ETL processing.
+/// It supports all common PostgreSQL data types including arrays, JSON, and temporal types.
+/// Each variant handles nullable data appropriately for the destination system.
+///
+/// The enum is designed to preserve type information and enable efficient conversion
+/// to destination formats while maintaining data fidelity.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
+    /// Represents a NULL database value
     Null,
+    /// Boolean value (true/false)
     Bool(bool),
+    /// Text or character data
     String(String),
+    /// 16-bit signed integer
     I16(i16),
+    /// 32-bit signed integer  
     I32(i32),
+    /// 32-bit unsigned integer
     U32(u32),
+    /// 64-bit signed integer
     I64(i64),
+    /// 32-bit floating point number
     F32(f32),
+    /// 64-bit floating point number
     F64(f64),
+    /// PostgreSQL NUMERIC/DECIMAL type with arbitrary precision
     Numeric(PgNumeric),
+    /// Date without time information
     Date(NaiveDate),
+    /// Time without date information
     Time(NaiveTime),
+    /// Timestamp without timezone information
     TimeStamp(NaiveDateTime),
+    /// Timestamp with timezone information in UTC
     TimeStampTz(DateTime<Utc>),
+    /// UUID (Universally Unique Identifier)
     Uuid(Uuid),
+    /// JSON data as parsed value
     Json(serde_json::Value),
+    /// Raw byte data
     Bytes(Vec<u8>),
+    /// Array of values with nullable elements
     Array(ArrayCell),
 }
 
 impl Cell {
+    /// Clears the cell value to its default state.
     pub fn clear(&mut self) {
         match self {
             Cell::Null => {}
@@ -63,28 +90,54 @@ impl Cell {
     }
 }
 
+/// Represents array data from PostgreSQL with nullable elements.
+///
+/// [`ArrayCell`] handles PostgreSQL array types where individual elements can be NULL.
+/// Each variant corresponds to a PostgreSQL array type and maintains the nullable
+/// nature of array elements as they exist in the source database.
+///
+/// This type is used internally during data conversion and can be converted to
+/// [`ArrayCellNonOptional`] for destinations that don't support nullable array elements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArrayCell {
+    /// NULL array value
     Null,
+    /// Array of nullable boolean values
     Bool(Vec<Option<bool>>),
+    /// Array of nullable string values
     String(Vec<Option<String>>),
+    /// Array of nullable 16-bit integers
     I16(Vec<Option<i16>>),
+    /// Array of nullable 32-bit integers
     I32(Vec<Option<i32>>),
+    /// Array of nullable 32-bit unsigned integers
     U32(Vec<Option<u32>>),
+    /// Array of nullable 64-bit integers
     I64(Vec<Option<i64>>),
+    /// Array of nullable 32-bit floats
     F32(Vec<Option<f32>>),
+    /// Array of nullable 64-bit floats
     F64(Vec<Option<f64>>),
+    /// Array of nullable PostgreSQL numeric values
     Numeric(Vec<Option<PgNumeric>>),
+    /// Array of nullable dates
     Date(Vec<Option<NaiveDate>>),
+    /// Array of nullable times
     Time(Vec<Option<NaiveTime>>),
+    /// Array of nullable timestamps
     TimeStamp(Vec<Option<NaiveDateTime>>),
+    /// Array of nullable timestamps with timezone
     TimeStampTz(Vec<Option<DateTime<Utc>>>),
+    /// Array of nullable UUIDs
     Uuid(Vec<Option<Uuid>>),
+    /// Array of nullable JSON values
     Json(Vec<Option<serde_json::Value>>),
+    /// Array of nullable byte arrays
     Bytes(Vec<Option<Vec<u8>>>),
 }
 
 impl ArrayCell {
+    /// Clears all elements from the array while preserving the variant type.
     fn clear(&mut self) {
         match self {
             ArrayCell::Null => {}

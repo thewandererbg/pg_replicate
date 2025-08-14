@@ -27,14 +27,28 @@ use crate::workers::table_sync::{TableSyncWorker, TableSyncWorkerState};
 use etl_postgres::replication::slots::get_slot_name;
 use etl_postgres::replication::worker::WorkerType;
 
+/// Handle for monitoring and controlling the apply worker.
+///
+/// [`ApplyWorkerHandle`] provides control over the apply worker that processes
+/// replication stream events and coordinates with table sync workers. The handle
+/// enables waiting for worker completion and checking final results.
 #[derive(Debug)]
 pub struct ApplyWorkerHandle {
     handle: Option<JoinHandle<EtlResult<()>>>,
 }
 
 impl WorkerHandle<()> for ApplyWorkerHandle {
+    /// Returns the current state of the apply worker.
+    ///
+    /// Since the apply worker doesn't expose detailed state information,
+    /// this method returns unit type and serves as a placeholder.
     fn state(&self) {}
 
+    /// Waits for the apply worker to complete execution.
+    ///
+    /// This method blocks until the apply worker finishes processing, either
+    /// due to successful completion, shutdown signal, or error. It properly
+    /// handles panics that might occur within the worker task.
     async fn wait(mut self) -> EtlResult<()> {
         let Some(handle) = self.handle.take() else {
             return Ok(());
@@ -52,6 +66,15 @@ impl WorkerHandle<()> for ApplyWorkerHandle {
     }
 }
 
+/// Worker that applies replication stream events to destinations.
+///
+/// [`ApplyWorker`] is the core worker responsible for processing PostgreSQL logical
+/// replication events and applying them to the configured destination. It coordinates
+/// with table sync workers during initial synchronization and handles the continuous
+/// replication stream during normal operation.
+///
+/// The worker manages transaction boundaries, coordinates table synchronization,
+/// and ensures data consistency throughout the replication process.
 #[derive(Debug)]
 pub struct ApplyWorker<S, D> {
     pipeline_id: PipelineId,
@@ -65,6 +88,11 @@ pub struct ApplyWorker<S, D> {
 }
 
 impl<S, D> ApplyWorker<S, D> {
+    /// Creates a new apply worker with the given configuration and dependencies.
+    ///
+    /// The worker will use the provided replication client to read the PostgreSQL
+    /// replication stream and coordinate with the table sync worker pool for
+    /// initial synchronization operations.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         pipeline_id: PipelineId,
@@ -96,6 +124,11 @@ where
 {
     type Error = EtlError;
 
+    /// Starts the apply worker and returns a handle for monitoring.
+    ///
+    /// This method initializes the apply worker by determining the starting LSN,
+    /// creating coordination signals, and launching the main apply loop. The worker
+    /// runs asynchronously and can be monitored through the returned handle.
     async fn start(self) -> EtlResult<ApplyWorkerHandle> {
         info!("starting apply worker");
 
@@ -146,11 +179,17 @@ where
     }
 }
 
+/// Determines the LSN position from which the apply worker should start reading the replication stream.
+///
+/// This function implements critical replication consistency logic by managing the apply worker's
+/// replication slot. The slot serves as a persistent marker in PostgreSQL's WAL (Write-Ahead Log)
+/// that tracks the apply worker's progress and prevents WAL deletion of unreplicated data.
 async fn get_start_lsn(
     pipeline_id: PipelineId,
     replication_client: &PgReplicationClient,
 ) -> EtlResult<PgLsn> {
     let slot_name = get_slot_name(pipeline_id, WorkerType::Apply)?;
+
     // TODO: validate that we only create the slot when we first start replication which
     //  means when all tables are in the Init state. In any other case we should raise an
     //  error because that means the apply slot was deleted and creating a fresh slot now
@@ -166,19 +205,37 @@ async fn get_start_lsn(
     Ok(start_lsn)
 }
 
+/// Internal coordination hook that implements apply loop integration with table sync workers.
+///
+/// [`ApplyWorkerHook`] serves as the critical coordination layer between the main apply loop
+/// that processes replication events and the table sync worker pool that handles initial data
+/// copying. This hook implements the [`ApplyLoopHook`] trait to provide custom logic for
+/// managing table lifecycle transitions and worker coordination.
 #[derive(Debug)]
 struct ApplyWorkerHook<S, D> {
+    /// Unique identifier for the pipeline this hook serves.
     pipeline_id: PipelineId,
+    /// Shared configuration for all coordinated operations.
     config: Arc<PipelineConfig>,
+    /// Pool of table sync workers that this hook coordinates.
     pool: TableSyncWorkerPool,
+    /// State store for tracking table replication progress.
     store: S,
+    /// Destination where replicated data is written.
     destination: D,
+    /// Shutdown signal receiver for graceful termination.
     shutdown_rx: ShutdownRx,
+    /// Signal transmitter for triggering table sync operations.
     force_syncing_tables_tx: SignalTx,
+    /// Semaphore controlling maximum concurrent table sync workers.
     table_sync_worker_permits: Arc<Semaphore>,
 }
 
 impl<S, D> ApplyWorkerHook<S, D> {
+    /// Creates a new apply worker hook with the given dependencies.
+    ///
+    /// This constructor initializes the hook with all necessary components
+    /// for coordinating between the apply loop and table sync workers.
     #[expect(clippy::too_many_arguments)]
     fn new(
         pipeline_id: PipelineId,
@@ -208,6 +265,11 @@ where
     S: StateStore + SchemaStore + Clone + Send + Sync + 'static,
     D: Destination + Clone + Send + Sync + 'static,
 {
+    /// Creates a new table sync worker for the specified table.
+    ///
+    /// This method constructs a fully configured table sync worker that can
+    /// handle the initial data synchronization for the given table. The worker
+    /// inherits the hook's configuration and coordination channels.
     async fn build_table_sync_worker(&self, table_id: TableId) -> TableSyncWorker<S, D> {
         info!("creating a new table sync worker for table {}", table_id);
 
@@ -224,6 +286,11 @@ where
         )
     }
 
+    /// Handles the lifecycle of a syncing table and its associated worker.
+    ///
+    /// This method checks if a table sync worker exists for the given table and
+    /// either creates a new worker or coordinates with the existing one. It manages
+    /// the transition from sync to catchup phases based on the current LSN.
     async fn handle_syncing_table(&self, table_id: TableId, current_lsn: PgLsn) -> EtlResult<bool> {
         let mut pool = self.pool.lock().await;
         let table_sync_worker_state = pool.get_active_worker_state(table_id);
@@ -240,6 +307,11 @@ where
             .await
     }
 
+    /// Coordinates with an existing table sync worker to manage state transitions.
+    ///
+    /// This method handles workers that are in the `SyncWait` state by transitioning
+    /// them to `Catchup` and then waiting for them to reach `SyncDone`. It ensures
+    /// proper synchronization between the apply worker and table sync workers.
     async fn handle_existing_worker(
         &self,
         table_id: TableId,
@@ -297,6 +369,12 @@ where
     S: StateStore + SchemaStore + Clone + Send + Sync + 'static,
     D: Destination + Clone + Send + Sync + 'static,
 {
+    /// Initializes table sync workers before the main apply loop begins.
+    ///
+    /// This hook method starts table sync workers for all tables that need
+    /// initial synchronization. It excludes tables already in `SyncDone` state
+    /// and avoids starting duplicate workers for tables that already have
+    /// active workers in the pool.
     async fn before_loop(&self, _start_lsn: PgLsn) -> EtlResult<bool> {
         info!("starting table sync workers before the main apply loop");
 
@@ -331,6 +409,11 @@ where
         Ok(true)
     }
 
+    /// Processes all tables currently in synchronization phases.
+    ///
+    /// This method coordinates the lifecycle of syncing tables by promoting
+    /// `SyncDone` tables to `Ready` state when the apply worker catches up
+    /// to their sync LSN. For other tables, it handles the typical sync process.
     async fn process_syncing_tables(
         &self,
         current_lsn: PgLsn,
@@ -383,6 +466,12 @@ where
         Ok(true)
     }
 
+    /// Handles table replication errors by updating the table's state.
+    ///
+    /// This method processes errors that occur during table replication by
+    /// converting them to appropriate error states and persisting the updated
+    /// state. The apply loop continues processing other tables after handling
+    /// the error.
     async fn mark_table_errored(
         &self,
         table_replication_error: TableReplicationError,
@@ -404,6 +493,15 @@ where
         Ok(true)
     }
 
+    /// Determines whether changes should be applied for a given table.
+    ///
+    /// This method evaluates the table's replication state to decide if events
+    /// should be processed by the apply worker. It considers both in-memory
+    /// worker states and persistent storage states to make the decision.
+    ///
+    /// Tables in `Ready` state always have changes applied. Tables in `SyncDone`
+    /// state only apply changes if the sync LSN is at or before the current
+    /// transaction's final LSN.
     async fn should_apply_changes(
         &self,
         table_id: TableId,
@@ -437,6 +535,11 @@ where
         Ok(should_apply_changes)
     }
 
+    /// Returns the worker type for this hook.
+    ///
+    /// This method identifies this hook as belonging to an apply worker,
+    /// which is used for coordination and logging purposes throughout
+    /// the replication system.
     fn worker_type(&self) -> WorkerType {
         WorkerType::Apply
     }
