@@ -4,7 +4,7 @@ source:
   name: "postgres"
   username: "postgres"
   password: "postgres"
-  slot_name: "stdout_slot"
+  slot_name: "bqslot"
   tls:
     trusted_root_certs: ""
     enabled: false
