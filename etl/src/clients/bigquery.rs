@@ -1,5 +1,3 @@
-use std::{collections::HashSet, fs};
-
 use bytes::{Buf, BufMut};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use futures::StreamExt;
@@ -19,6 +17,9 @@ use gcp_bigquery_client::{
 };
 use postgres::schema::{ColumnSchema, TableId, TableSchema};
 use prost::Message;
+use serde::ser::SerializeSeq;
+use serde::{Serialize, Serializer};
+use std::{collections::HashSet, fs};
 use tokio_postgres::types::{PgLsn, Type};
 use tracing::info;
 use uuid::Uuid;
@@ -1293,89 +1294,53 @@ impl PgNumeric {
     }
 }
 
-// Convert ArrayCell to JSON string
-fn array_cell_to_json(array_cell: &ArrayCell) -> String {
-    match array_cell {
-        ArrayCell::Null => "null".to_string(),
-        ArrayCell::Bool(vec) => {
-            let values: Vec<bool> = vec.iter().flatten().copied().collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::String(vec) => {
-            let values: Vec<String> = vec.iter().flatten().cloned().collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::I16(vec) => {
-            let values: Vec<i16> = vec.iter().flatten().copied().collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::I32(vec) => {
-            let values: Vec<i32> = vec.iter().flatten().copied().collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::U32(vec) => {
-            let values: Vec<u32> = vec.iter().flatten().copied().collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::I64(vec) => {
-            let values: Vec<i64> = vec.iter().flatten().copied().collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::F32(vec) => {
-            let values: Vec<f32> = vec.iter().flatten().copied().collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::F64(vec) => {
-            let values: Vec<f64> = vec.iter().flatten().copied().collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::Numeric(vec) => {
-            let values: Vec<f64> = vec.iter().flatten().map(|n| n.to_f64()).collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::Date(vec) => {
-            let values: Vec<String> = vec
-                .iter()
-                .flatten()
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::Time(vec) => {
-            let values: Vec<String> = vec
-                .iter()
-                .flatten()
-                .map(|t| t.format("%H:%M:%S%.f").to_string())
-                .collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::TimeStamp(vec) => {
-            let values: Vec<String> = vec
-                .iter()
-                .flatten()
-                .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
-                .collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::TimeStampTz(vec) => {
-            let values: Vec<String> = vec
-                .iter()
-                .flatten()
-                .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f%:z").to_string())
-                .collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::Uuid(vec) => {
-            let values: Vec<String> = vec.iter().flatten().map(|u| u.to_string()).collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::Json(vec) => {
-            let values: Vec<String> = vec.iter().flatten().map(|j| j.to_string()).collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
-        }
-        ArrayCell::Bytes(vec) => {
-            let values: Vec<Vec<u8>> = vec.iter().flatten().cloned().collect();
-            serde_json::to_string(&values).unwrap_or("[]".to_string())
+impl Serialize for ArrayCell {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            ArrayCell::Null => serializer.serialize_none(),
+            ArrayCell::Bool(vec) => vec.serialize(serializer),
+            ArrayCell::String(vec) => vec.serialize(serializer),
+            ArrayCell::I16(vec) => vec.serialize(serializer),
+            ArrayCell::I32(vec) => vec.serialize(serializer),
+            ArrayCell::U32(vec) => vec.serialize(serializer),
+            ArrayCell::I64(vec) => vec.serialize(serializer),
+            ArrayCell::F32(vec) => vec.serialize(serializer),
+            ArrayCell::F64(vec) => vec.serialize(serializer),
+            ArrayCell::Json(vec) => vec.serialize(serializer),
+            ArrayCell::Bytes(vec) => vec.serialize(serializer),
+            ArrayCell::Date(vec) => vec.serialize(serializer),
+            ArrayCell::Time(vec) => vec.serialize(serializer),
+            ArrayCell::TimeStamp(vec) => vec.serialize(serializer),
+            ArrayCell::TimeStampTz(vec) => vec.serialize(serializer),
+
+            ArrayCell::Numeric(vec) => {
+                let mut seq = serializer.serialize_seq(Some(vec.len()))?;
+                for item in vec {
+                    match item {
+                        Some(n) => seq.serialize_element(&Some(n.to_f64()))?,
+                        None => seq.serialize_element(&None::<f64>)?,
+                    }
+                }
+                seq.end()
+            }
+
+            ArrayCell::Uuid(vec) => {
+                let mut seq = serializer.serialize_seq(Some(vec.len()))?;
+                for item in vec {
+                    match item {
+                        Some(u) => seq.serialize_element(&Some(u.to_string()))?,
+                        None => seq.serialize_element(&None::<String>)?,
+                    }
+                }
+                seq.end()
+            }
         }
     }
+}
+
+pub fn array_cell_to_json(array_cell: &ArrayCell) -> String {
+    serde_json::to_string(array_cell).unwrap_or_else(|_| "[]".to_string())
 }

@@ -1,7 +1,0 @@
-project: "pgrep_clickhouse"
-pipeline:
-  id: 1
-  publication_name: "my_publication"
-  batch:
-    max_size: 100000
-    max_fill_ms: 60000

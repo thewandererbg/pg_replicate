@@ -1,8 +1,0 @@
-services:
-  server:
-    build:
-      context: ..
-      dockerfile: replicator_clickhouse/Dockerfile
-    container_name: "replicator"
-    volumes:
-      - ./configuration:/app/configuration:Z

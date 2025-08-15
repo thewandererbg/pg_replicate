@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::utils::tokio::MakeRustlsConnect;
 use pg_escape::{quote_identifier, quote_literal};
 use postgres::schema::{ColumnSchema, TableId, TableName, TableSchema};
 use postgres::tokio::config::PgConnectionConfig;
@@ -11,7 +12,6 @@ use tokio_postgres::{
     types::{Kind, PgLsn, Type},
     Client as PostgresClient, Config, CopyOutStream, NoTls, SimpleQueryMessage,
 };
-use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{info, warn};
 
 pub struct SlotInfo {
