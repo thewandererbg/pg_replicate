@@ -92,6 +92,9 @@ create table if not exists all_postgres_types
     col_array_text       text[],
     col_array_timestamp       timestamp[],
     col_array_timestamptz       timestamptz[],
+    col_array_date        date[],
+    col_array_time        time[],
+    col_array_timetz      timetz[],
 
     col_range_int4       int4range,
     col_range_num        numrange,

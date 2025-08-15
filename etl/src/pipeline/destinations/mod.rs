@@ -11,12 +11,10 @@ use super::PipelineResumptionState;
 
 #[cfg(feature = "bigquery")]
 pub mod bigquery;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
-#[cfg(feature = "stdout")]
-pub mod stdout;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
+#[cfg(feature = "stdout")]
+pub mod stdout;
 
 pub trait DestinationError: std::error::Error + Send + Sync + 'static {}
 

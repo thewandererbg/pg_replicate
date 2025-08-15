@@ -5,8 +5,9 @@ insert into all_postgres_types (col_smallint, col_integer, col_bigint, col_decim
                                , col_interval, col_json, col_jsonb, col_xml, col_uuid, col_inet, col_cidr, col_macaddr
                                , col_macaddr8, col_point, col_line, col_lseg, col_box, col_path, col_polygon, col_circle
                                , col_bit, col_bit_varying, col_tsquery, col_tsvector, col_enum, col_array_int
-                               , col_array_text, col_array_timestamp, col_array_timestamptz, col_range_int4
-                               , col_range_num, col_range_ts, col_range_tstz, col_range_date)
+                               , col_array_text, col_array_timestamp, col_array_timestamptz, col_array_date, col_array_time, col_array_timetz
+                               , col_range_int4, col_range_num, col_range_ts, col_range_tstz, col_range_date)
+
 select floor(random() * 100)::smallint as col_smallint
      , floor(random() * 1000)::integer as col_integer
      , floor(random() * 100000)::bigint as col_bigint
@@ -50,6 +51,9 @@ select floor(random() * 100)::smallint as col_smallint
      , array ['a','b','c'] as col_array_text
      , array(select now() + (i * interval '1 hour') from generate_series(0, 4) as i) as col_array_timestamp
      , array(select now() + (i * interval '1 hour') from generate_series(0, 4) as i) as col_array_timestamptz
+     , array(select current_date + i from generate_series(0, 4) as i) as col_array_date
+     , array(select (current_time + (i * interval '1 hour')) from generate_series(0, 4) as i) as col_array_time
+     , array(select (current_time + (i * interval '1 hour')) from generate_series(0, 4) as i) as col_array_timetz
      , int4range(1, 10) as col_range_int4
      , numrange(1.1, 9.9) as col_range_num
      , tsrange(now()::timestamp, (now() + interval '1 hour')::timestamp) as col_range_ts
