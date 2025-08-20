@@ -423,7 +423,7 @@ where
         table_rows: Vec<TableRow>,
         orig_table_id: &TableId,
         use_cdc_sequence_column: bool,
-    ) -> EtlResult<()> {
+    ) -> EtlResult<usize> {
         // First attempt - optimistically assume the table exists
         let result = inner
             .client
@@ -436,7 +436,7 @@ where
             .await;
 
         match result {
-            Ok(()) => Ok(()),
+            Ok(sent_bytes) => Ok(sent_bytes),
             Err(err) => {
                 // From our testing, when trying to send data to a missing table, this is the error that is
                 // returned:
@@ -498,7 +498,7 @@ where
                 .push(BigQueryOperationType::Upsert.into_cell());
         }
 
-        Self::stream_rows_with_fallback(
+        let sent_bytes = Self::stream_rows_with_fallback(
             &mut inner,
             &dataset_id,
             &sequenced_bigquery_table_id,
@@ -508,6 +508,17 @@ where
             false,
         )
         .await?;
+
+        // Logs with egress_metric = true can be used to identify egress logs.
+        // This can e.g. be used to send egress logs to a location different
+        // than the other logs. These logs should also have sent_bytes set to
+        // the number of bytes sent to the destination.
+        info!(
+            sent_bytes,
+            phase = "table_copy",
+            egress_metric = true,
+            "Wrote table rows"
+        );
 
         Ok(())
     }
@@ -596,7 +607,7 @@ where
                         Self::prepare_cdc_streaming_for_table(&mut inner, &table_id, true).await?;
 
                     let dataset_id = inner.dataset_id.clone();
-                    Self::stream_rows_with_fallback(
+                    let sent_bytes = Self::stream_rows_with_fallback(
                         &mut inner,
                         &dataset_id,
                         &bq_table_id,
@@ -606,6 +617,17 @@ where
                         true,
                     )
                     .await?;
+
+                    // Logs with egress_metric = true can be used to identify egress logs.
+                    // This can e.g. be used to send egress logs to a location different
+                    // than the other logs. These logs should also have sent_bytes set to
+                    // the number of bytes sent to the destination.
+                    info!(
+                        sent_bytes,
+                        phase = "apply",
+                        egress_metric = true,
+                        "Wrote apply events"
+                    );
                 }
             }
 
