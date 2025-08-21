@@ -65,7 +65,7 @@ DB_PORT="${POSTGRES_PORT:=5430}"
 DB_HOST="${POSTGRES_HOST:=localhost}"
 
 # Benchmark configuration
-RUNS="${HYPERFINE_RUNS:=3}"
+RUNS="${HYPERFINE_RUNS:=1}"
 PUBLICATION_NAME="${PUBLICATION_NAME:=bench_pub}"
 BATCH_MAX_SIZE="${BATCH_MAX_SIZE:=1000000}"
 BATCH_MAX_FILL_MS="${BATCH_MAX_FILL_MS:=10000}"
@@ -80,6 +80,7 @@ BQ_PROJECT_ID="${BQ_PROJECT_ID:=}"
 BQ_DATASET_ID="${BQ_DATASET_ID:=}"
 BQ_SA_KEY_FILE="${BQ_SA_KEY_FILE:=}"
 BQ_MAX_STALENESS_MINS="${BQ_MAX_STALENESS_MINS:=}"
+BQ_MAX_CONCURRENT_STREAMS="${BQ_MAX_CONCURRENT_STREAMS:=}"
 
 # Optional dry-run mode
 DRY_RUN="${DRY_RUN:=false}"
@@ -101,6 +102,9 @@ if [[ "${DESTINATION}" == "big-query" ]]; then
   echo "   BigQuery SA Key: ${BQ_SA_KEY_FILE}"
   if [[ -n "${BQ_MAX_STALENESS_MINS}" ]]; then
     echo "   BigQuery Max Staleness: ${BQ_MAX_STALENESS_MINS} mins"
+  fi
+  if [[ -n "${BQ_MAX_CONCURRENT_STREAMS}" ]]; then
+    echo "   BigQuery Max Concurrent Streams: ${BQ_MAX_CONCURRENT_STREAMS}"
   fi
 fi
 
@@ -180,6 +184,9 @@ if [[ "${DESTINATION}" == "big-query" ]]; then
   RUN_CMD="${RUN_CMD} --bq-sa-key-file ${BQ_SA_KEY_FILE}"
   if [[ -n "${BQ_MAX_STALENESS_MINS}" ]]; then
     RUN_CMD="${RUN_CMD} --bq-max-staleness-mins ${BQ_MAX_STALENESS_MINS}"
+  fi
+  if [[ -n "${BQ_MAX_CONCURRENT_STREAMS}" ]]; then
+    RUN_CMD="${RUN_CMD} --bq-max-concurrent-streams ${BQ_MAX_CONCURRENT_STREAMS}"
   fi
 fi
 

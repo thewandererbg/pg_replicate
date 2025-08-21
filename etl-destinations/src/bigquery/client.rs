@@ -1,26 +1,24 @@
 use etl::error::{ErrorKind, EtlError, EtlResult};
 use etl::etl_error;
 use etl::types::{Cell, ColumnSchema, TableRow, Type};
-use futures::StreamExt;
 use gcp_bigquery_client::google::cloud::bigquery::storage::v1::RowError;
-use gcp_bigquery_client::storage::{ColumnMode, StorageApi};
+use gcp_bigquery_client::storage::ColumnMode;
 use gcp_bigquery_client::yup_oauth2::parse_service_account_key;
 use gcp_bigquery_client::{
     Client,
     error::BQError,
     model::{query_request::QueryRequest, query_response::ResultSet},
-    storage::{ColumnType, FieldDescriptor, StreamName, TableDescriptor},
+    storage::{ColumnType, FieldDescriptor, StreamName, TableBatch, TableDescriptor},
 };
 use metrics::gauge;
+use prost::Message;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::bigquery::encoding::BigQueryTableRow;
 use crate::metrics::{BQ_BATCH_SEND_MILLISECONDS_TOTAL, BQ_BATCH_SIZE};
-
-/// Maximum byte size for streaming data to BigQuery.
-const MAX_SIZE_BYTES: usize = 9 * 1024 * 1024;
 
 /// Trace identifier for ETL operations in BigQuery client.
 const ETL_TRACE_ID: &str = "ETL BigQueryClient";
@@ -284,87 +282,123 @@ impl BigQueryClient {
         Ok(exists)
     }
 
-    /// Streams rows to BigQuery using the Storage Write API.
+    /// Streams table batches to BigQuery using the concurrent Storage Write API.
     ///
-    /// Efficiently ingests data by batching rows to respect size limits and
-    /// using the high-performance Storage Write API. Returns the size of the
-    /// rows sent in bytes.
-    pub async fn stream_rows(
-        &mut self,
-        dataset_id: &BigQueryDatasetId,
-        table_id: &BigQueryTableId,
-        table_descriptor: &TableDescriptor,
-        table_rows: Vec<TableRow>,
-    ) -> EtlResult<usize> {
-        // We map the table rows into `BigQueryTableRow`s instances, so that we also do a validation
-        // of the cells.
-        let table_rows = table_rows
-            .into_iter()
-            .map(BigQueryTableRow::try_from)
-            .collect::<EtlResult<Vec<_>>>()?;
+    /// Accepts pre-constructed TableBatch objects and processes them concurrently with
+    /// controlled parallelism. This allows streaming to multiple different tables efficiently
+    /// in a single call.
+    ///
+    /// If ordering is not required, you may split a table's data into multiple batches,
+    /// which can be processed concurrently.
+    /// If ordering guarantees are needed, all data for a given table must be included
+    /// in a single batch.
+    pub async fn stream_table_batches_concurrent(
+        &self,
+        table_batches: Vec<TableBatch<BigQueryTableRow>>,
+        max_concurrent_streams: usize,
+    ) -> EtlResult<(usize, usize)> {
+        if table_batches.is_empty() {
+            return Ok((0, 0));
+        }
 
-        // We create a slice on table rows, which will be updated while the streaming progresses.
-        //
-        // Using a slice allows us to deallocate the vector only at the end of streaming, which leads
-        // to fewer operations being performed.
-        let mut table_rows = table_rows.as_slice();
+        // We track the number of rows in each table batch. Note that this is not the actual batch
+        // being sent to BigQuery, since there might be optimizations performed by the append table
+        // batches method.
+        for table_batch in &table_batches {
+            gauge!(BQ_BATCH_SIZE).set(table_batch.rows.len() as f64);
+        }
 
-        let default_stream = StreamName::new_default(
-            self.project_id.clone(),
-            dataset_id.to_string(),
-            table_id.to_string(),
+        debug!(
+            "streaming {:?} table batches concurrently with maximum {:?} concurrent streams",
+            table_batches.len(),
+            max_concurrent_streams
         );
+
+        let before_sending = Instant::now();
+
+        // Use the new concurrent append_table_batches method
+        let batch_results = self
+            .client
+            .storage()
+            .append_table_batches_concurrent(table_batches, max_concurrent_streams, ETL_TRACE_ID)
+            .await
+            .map_err(bq_error_to_etl_error)?;
 
         // We use the rows' encoded length to measure the egress metric. This does not
         // count some bytes sent as overhead during the gRPC API calls. Ideally we
         // would want to count the bytes leaving the TCP connection but we do not have
         // that low level access, hence will have to settle for something accessible
         // in the application.
-        let mut total_rows_encoded_len = 0;
+        let mut total_bytes_sent = 0;
+        let mut total_bytes_received = 0;
 
-        loop {
-            let (rows, num_processed_rows) =
-                StorageApi::create_rows(table_descriptor, table_rows, MAX_SIZE_BYTES);
+        // Process results and accumulate all errors.
+        let mut batches_responses_errors = Vec::new();
+        for batch_result in batch_results {
+            for response in batch_result.responses {
+                match response {
+                    Ok(response) => {
+                        debug!(
+                            "append rows response for batch {:?}: {:?} ",
+                            batch_result.batch_index, response
+                        );
 
-            total_rows_encoded_len += rows.encoded_len();
-            let before_sending = Instant::now();
+                        total_bytes_received += response.encoded_len();
 
-            let mut append_rows_stream = self
-                .client
-                .storage_mut()
-                .append_rows(&default_stream, rows, ETL_TRACE_ID.to_owned())
-                .await
-                .map_err(bq_error_to_etl_error)?;
-
-            gauge!(BQ_BATCH_SIZE).set(num_processed_rows as f64);
-
-            if let Some(append_rows_response) = append_rows_stream.next().await {
-                let append_rows_response = append_rows_response
-                    .map_err(BQError::from)
-                    .map_err(bq_error_to_etl_error)?;
-
-                if !append_rows_response.row_errors.is_empty() {
-                    // We convert the error into an `ETLError`.
-                    let row_errors = append_rows_response
-                        .row_errors
-                        .into_iter()
-                        .map(row_error_to_etl_error)
-                        .collect::<Vec<_>>();
-
-                    return Err(row_errors.into());
+                        for row_error in response.row_errors {
+                            let row_error = row_error_to_etl_error(row_error);
+                            batches_responses_errors.push(row_error);
+                        }
+                    }
+                    Err(status) => {
+                        batches_responses_errors.push(bq_error_to_etl_error(status.into()));
+                    }
                 }
             }
 
-            let time_taken_to_send = before_sending.elapsed().as_millis();
-            gauge!(BQ_BATCH_SEND_MILLISECONDS_TOTAL).set(time_taken_to_send as f64);
-
-            table_rows = &table_rows[num_processed_rows..];
-            if table_rows.is_empty() {
-                break;
-            }
+            total_bytes_sent += batch_result.bytes_sent;
         }
 
-        Ok(total_rows_encoded_len)
+        let time_taken_to_send = before_sending.elapsed().as_millis();
+        gauge!(BQ_BATCH_SEND_MILLISECONDS_TOTAL).set(time_taken_to_send as f64);
+
+        if batches_responses_errors.is_empty() {
+            return Ok((total_bytes_sent, total_bytes_received));
+        }
+
+        Err(batches_responses_errors.into())
+    }
+
+    /// Creates a TableBatch for a specific table with validated rows.
+    ///
+    /// Converts TableRow instances to BigQueryTableRow and creates a properly configured
+    /// TableBatch with the appropriate stream name and table descriptor.
+    pub fn create_table_batch(
+        &self,
+        dataset_id: &BigQueryDatasetId,
+        table_id: &BigQueryTableId,
+        table_descriptor: Arc<TableDescriptor>,
+        rows: Vec<TableRow>,
+    ) -> EtlResult<TableBatch<BigQueryTableRow>> {
+        let validated_rows = rows
+            .into_iter()
+            .map(BigQueryTableRow::try_from)
+            .collect::<EtlResult<Vec<_>>>()?;
+
+        // We want to use the default stream from BigQuery since it allows multiple connections to
+        // send data to it. In addition, it's available by default for every table, so it also reduces
+        // complexity.
+        let stream_name = StreamName::new_default(
+            self.project_id.clone(),
+            dataset_id.to_string(),
+            table_id.to_string(),
+        );
+
+        Ok(TableBatch::new(
+            stream_name,
+            table_descriptor,
+            validated_rows,
+        ))
     }
 
     /// Executes a BigQuery SQL query and returns the result set.
@@ -693,6 +727,19 @@ fn bq_error_to_etl_error(err: BQError) -> EtlError {
                 (ErrorKind::DestinationError, "BigQuery gRPC status error")
             }
         }
+
+        // Concurrency and task errors
+        BQError::SemaphorePermitError(_) => (
+            ErrorKind::DestinationError,
+            "BigQuery semaphore permit error",
+        ),
+        BQError::TokioTaskError(_) => {
+            (ErrorKind::DestinationError, "BigQuery task execution error")
+        }
+        BQError::ConnectionPoolError(_) => (
+            ErrorKind::DestinationError,
+            "BigQuery connection pool error",
+        ),
     };
 
     etl_error!(kind, description, err.to_string())
