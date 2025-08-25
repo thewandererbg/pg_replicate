@@ -1537,7 +1537,7 @@ async fn table_array_with_null_values() {
         .unwrap()
         .execute(
             &format!(
-                "INSERT INTO {} (int_array) VALUES (ARRAY[1, NULL])",
+                "insert into {} (int_array) values (array[1, null])",
                 table_name.as_quoted_identifier()
             ),
             &[],
@@ -1553,7 +1553,10 @@ async fn table_array_with_null_values() {
     // Wait for the pipeline expecting an error to be returned.
     let err = pipeline.shutdown_and_wait().await.err().unwrap();
     assert_eq!(err.kinds().len(), 1);
-    assert_eq!(err.kinds()[0], ErrorKind::NullValuesNotSupportedInArray);
+    assert_eq!(
+        err.kinds()[0],
+        ErrorKind::NullValuesNotSupportedInArrayInDestination
+    );
 
     // Reset and try with valid array (no nulls)
     database
@@ -1562,7 +1565,7 @@ async fn table_array_with_null_values() {
         .unwrap()
         .execute(
             &format!(
-                "DELETE FROM {} WHERE true",
+                "delete from {} where true",
                 table_name.as_quoted_identifier()
             ),
             &[],
@@ -1605,7 +1608,7 @@ async fn table_array_with_null_values() {
         .unwrap()
         .execute(
             &format!(
-                "INSERT INTO {} (int_array) VALUES (ARRAY[1, 2, 3])",
+                "insert into {} (int_array) values (array[1, 2, 3])",
                 table_name.as_quoted_identifier()
             ),
             &[],
@@ -1636,4 +1639,133 @@ async fn table_array_with_null_values() {
             3
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn table_validation_out_of_bounds_values() {
+    init_test_tracing();
+    install_crypto_provider_for_bigquery();
+
+    let database = spawn_source_database().await;
+    let bigquery_database = setup_bigquery_connection().await;
+
+    // Create tables with different error types
+    let huge_numeric_table = test_table_name("huge_numeric");
+    let huge_numeric_table_id = database
+        .create_table(
+            huge_numeric_table.clone(),
+            true,
+            &[("huge_numeric", "numeric")],
+        )
+        .await
+        .unwrap();
+
+    let old_date_table = test_table_name("old_date");
+    let old_date_table_id = database
+        .create_table(old_date_table.clone(), true, &[("test_date", "date")])
+        .await
+        .unwrap();
+
+    let nan_array_table = test_table_name("nan_array");
+    let nan_array_table_id = database
+        .create_table(
+            nan_array_table.clone(),
+            true,
+            &[("numeric_array", "numeric[]")],
+        )
+        .await
+        .unwrap();
+
+    // Insert out-of-bounds data into each table
+    database
+        .client
+        .as_ref()
+        .unwrap()
+        .execute(
+            &format!(
+                "insert into {} (huge_numeric) values ({})",
+                huge_numeric_table.as_quoted_identifier(),
+                "'123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    database
+        .client
+        .as_ref()
+        .unwrap()
+        .execute(
+            &format!(
+                "insert into {} (test_date) values ('0001-01-01'::date - interval '1 day')",
+                old_date_table.as_quoted_identifier()
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    database
+        .client
+        .as_ref()
+        .unwrap()
+        .execute(
+            &format!(
+                "insert into {} (numeric_array) values (array['NaN'::numeric, '123.45'::numeric])",
+                nan_array_table.as_quoted_identifier()
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let store = NotifyingStore::new();
+    let raw_destination = bigquery_database.build_destination(store.clone()).await;
+    let destination = TestDestinationWrapper::wrap(raw_destination);
+
+    let publication_name = "test_pub_validation".to_string();
+    database
+        .create_publication(
+            &publication_name,
+            &[huge_numeric_table, old_date_table, nan_array_table],
+        )
+        .await
+        .expect("Failed to create publication");
+
+    let pipeline_id: PipelineId = random();
+    let mut pipeline = create_pipeline(
+        &database.config,
+        pipeline_id,
+        publication_name,
+        store.clone(),
+        destination.clone(),
+    );
+
+    // Register notifications for errored replication phase
+    let huge_numeric_error_notify = store
+        .notify_on_table_state(huge_numeric_table_id, TableReplicationPhaseType::Errored)
+        .await;
+
+    let old_date_error_notify = store
+        .notify_on_table_state(old_date_table_id, TableReplicationPhaseType::Errored)
+        .await;
+
+    let nan_array_error_notify = store
+        .notify_on_table_state(nan_array_table_id, TableReplicationPhaseType::Errored)
+        .await;
+
+    pipeline.start().await.unwrap();
+
+    // Wait for all tables to enter errored state
+    huge_numeric_error_notify.notified().await;
+    old_date_error_notify.notified().await;
+    nan_array_error_notify.notified().await;
+
+    let err = pipeline.shutdown_and_wait().await.err().unwrap();
+    assert_eq!(err.kinds().len(), 3);
+    assert!(
+        err.kinds()
+            .contains(&ErrorKind::UnsupportedValueInDestination)
+    );
 }
