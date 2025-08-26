@@ -5,7 +5,7 @@ use actix_web::{
     web::{Data, Json, Path},
 };
 use etl_config::shared::{ReplicatorConfig, SupabaseConfig, TlsConfig};
-use etl_postgres::replication::{TableLookupError, get_table_name_from_oid, state};
+use etl_postgres::replication::{TableLookupError, get_table_name_from_oid, health, state};
 use etl_postgres::schema::TableId;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,9 @@ pub enum PipelineError {
 
     #[error("The table state is not rollbackable: {0}")]
     NotRollbackable(String),
+
+    #[error("The ETL table state has not been initialized first")]
+    EtlStateNotInitialized,
 
     #[error("invalid destination config")]
     InvalidConfig(#[from] serde_json::Error),
@@ -145,9 +148,9 @@ impl ResponseError for PipelineError {
             | PipelineError::InvalidTableReplicationState(_)
             | PipelineError::MissingTableReplicationState => StatusCode::INTERNAL_SERVER_ERROR,
             PipelineError::NotRollbackable(_) => StatusCode::BAD_REQUEST,
-            PipelineError::PipelineNotFound(_) | PipelineError::ImageNotFoundById(_) => {
-                StatusCode::NOT_FOUND
-            }
+            PipelineError::PipelineNotFound(_)
+            | PipelineError::ImageNotFoundById(_)
+            | PipelineError::EtlStateNotInitialized => StatusCode::NOT_FOUND,
             PipelineError::TenantId(_)
             | PipelineError::SourceNotFound(_)
             | PipelineError::DestinationNotFound(_) => StatusCode::BAD_REQUEST,
@@ -811,6 +814,11 @@ pub async fn get_pipeline_replication_status(
     let source_pool =
         connect_to_source_database_with_defaults(&source.config.into_connection_config()).await?;
 
+    // Ensure ETL tables exist in the source DB
+    if !health::etl_tables_present(&source_pool).await? {
+        return Err(PipelineError::EtlStateNotInitialized);
+    }
+
     // Fetch replication state for all tables in this pipeline
     let state_rows = state::get_table_replication_state_rows(&source_pool, pipeline_id).await?;
 
@@ -893,6 +901,11 @@ pub async fn rollback_table_state(
     // Connect to the source database to perform rollback
     let source_pool =
         connect_to_source_database_with_defaults(&source.config.into_connection_config()).await?;
+
+    // Ensure ETL tables exist in the source DB
+    if !health::etl_tables_present(&source_pool).await? {
+        return Err(PipelineError::EtlStateNotInitialized);
+    }
 
     // First, check current state to ensure it's rollbackable (manual retry policy)
     let state_rows = state::get_table_replication_state_rows(&source_pool, pipeline_id).await?;
