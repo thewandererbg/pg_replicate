@@ -1,14 +1,12 @@
-use etl_postgres::schema::{ColumnSchema, TableId, TableName, TableSchema};
 use etl_postgres::tokio::test_utils::{PgDatabase, id_column_schema};
+use etl_postgres::types::{ColumnSchema, TableId, TableName, TableSchema};
 use std::ops::RangeInclusive;
 use tokio_postgres::types::{PgLsn, Type};
 use tokio_postgres::{Client, GenericClient};
 
-use crate::conversions::Cell;
-use crate::conversions::event::{Event, InsertEvent};
-use crate::conversions::table_row::TableRow;
 use crate::test_utils::database::test_table_name;
 use crate::test_utils::test_destination_wrapper::TestDestinationWrapper;
+use crate::types::{Cell, Event, InsertEvent, TableRow};
 
 #[derive(Debug, Clone, Copy)]
 pub enum TableSelection {
