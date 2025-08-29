@@ -1,14 +1,12 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use etl_postgres::types::{TableId, TableSchema};
-use tokio::{
-    runtime::Handle,
-    sync::{Notify, RwLock},
-};
+use tokio::sync::{Notify, RwLock};
 
 use crate::error::{ErrorKind, EtlError, EtlResult};
 use crate::etl_error;
 use crate::state::table::{TableReplicationPhase, TableReplicationPhaseType};
+use crate::store::cleanup::CleanupStore;
 use crate::store::schema::SchemaStore;
 use crate::store::state::StateStore;
 
@@ -282,14 +280,21 @@ impl SchemaStore for NotifyingStore {
     }
 }
 
+impl CleanupStore for NotifyingStore {
+    async fn cleanup_table_state(&self, table_id: TableId) -> EtlResult<()> {
+        let mut inner = self.inner.write().await;
+
+        inner.table_replication_states.remove(&table_id);
+        inner.table_state_history.remove(&table_id);
+        inner.table_schemas.remove(&table_id);
+        inner.table_mappings.remove(&table_id);
+
+        Ok(())
+    }
+}
+
 impl fmt::Debug for NotifyingStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let inner = tokio::task::block_in_place(move || {
-            Handle::current().block_on(async move { self.inner.read().await })
-        });
-        f.debug_struct("NotifyingStateStore")
-            .field("table_replication_states", &inner.table_replication_states)
-            .field("table_schemas", &inner.table_schemas)
-            .finish()
+        f.debug_struct("NotifyingStore").finish()
     }
 }

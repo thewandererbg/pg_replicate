@@ -141,6 +141,155 @@ async fn table_schema_copy_survives_pipeline_restarts() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn publication_changes_are_correctly_handled() {
+    init_test_tracing();
+
+    let database = spawn_source_database().await;
+
+    // Create two tables in the test schema and a publication for that schema.
+    let table_1 = test_table_name("table_1");
+    let table_1_id = database
+        .create_table(table_1.clone(), true, &[("value", "int4 not null")])
+        .await
+        .unwrap();
+    let table_2 = test_table_name("table_2");
+    let table_2_id = database
+        .create_table(table_2.clone(), true, &[("value", "int4 not null")])
+        .await
+        .unwrap();
+
+    let publication_name = "test_pub_cleanup";
+    database
+        .create_publication_for_all(publication_name, Some(&table_1.schema))
+        .await
+        .unwrap();
+
+    let store = NotifyingStore::new();
+    let destination = TestDestinationWrapper::wrap(MemoryDestination::new());
+
+    let pipeline_id: PipelineId = random();
+    let mut pipeline = create_pipeline(
+        &database.config,
+        pipeline_id,
+        publication_name.to_string(),
+        store.clone(),
+        destination.clone(),
+    );
+
+    // Wait for initial copy completion (SyncDone) for both tables.
+    let table_1_done = store
+        .notify_on_table_state(table_1_id, TableReplicationPhaseType::SyncDone)
+        .await;
+    let table_2_done = store
+        .notify_on_table_state(table_2_id, TableReplicationPhaseType::SyncDone)
+        .await;
+
+    pipeline.start().await.unwrap();
+
+    table_1_done.notified().await;
+    table_2_done.notified().await;
+
+    // Insert one row in each table and wait for two insert events.
+    let inserts_notify = destination
+        .wait_for_events_count(vec![(EventType::Insert, 2)])
+        .await;
+    database
+        .insert_values(table_1.clone(), &["value"], &[&1])
+        .await
+        .unwrap();
+    database
+        .insert_values(table_2.clone(), &["value"], &[&1])
+        .await
+        .unwrap();
+    inserts_notify.notified().await;
+
+    // Shutdown pipeline before altering publication (by dropping one table)
+    pipeline.shutdown_and_wait().await.unwrap();
+
+    // Drop table_2 so it's no longer part of the publication
+    database
+        .client
+        .as_ref()
+        .unwrap()
+        .execute(
+            &format!("drop table {}", table_2.as_quoted_identifier()),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // Create table_3 which is going to be added to the publication.
+    let table_3 = test_table_name("table_3");
+    let table_3_id = database
+        .create_table(table_3.clone(), true, &[("value", "int4 not null")])
+        .await
+        .unwrap();
+
+    // Restart pipeline; it should detect table_2 is gone and purge its state
+    let mut pipeline = create_pipeline(
+        &database.config,
+        pipeline_id,
+        publication_name.to_string(),
+        store.clone(),
+        destination.clone(),
+    );
+
+    // Wait for the table_3 to be done.
+    let table_3_done = store
+        .notify_on_table_state(table_3_id, TableReplicationPhaseType::SyncDone)
+        .await;
+
+    pipeline.start().await.unwrap();
+
+    table_3_done.notified().await;
+
+    // Insert one row in table_1 and wait for it. (We wait for 4 inserts since it keeps the previous
+    // ones).
+    let inserts_notify = destination
+        .wait_for_events_count(vec![(EventType::Insert, 4)])
+        .await;
+
+    database
+        .insert_values(table_1.clone(), &["value"], &[&2])
+        .await
+        .unwrap();
+    database
+        .insert_values(table_3.clone(), &["value"], &[&1])
+        .await
+        .unwrap();
+
+    inserts_notify.notified().await;
+
+    pipeline.shutdown_and_wait().await.unwrap();
+
+    // Assert that table_2 state is gone but destination data remains
+    let states = store.get_table_replication_states().await;
+    assert!(states.contains_key(&table_1_id));
+    assert!(!states.contains_key(&table_2_id));
+    assert!(states.contains_key(&table_3_id));
+
+    // The destination should have the 2 events of the first table, the 1 event of the removed table
+    // and the 1 event of the new table.
+    let events = destination.get_events().await;
+    let grouped = group_events_by_type_and_table_id(&events);
+    let table_1_inserts = grouped
+        .get(&(EventType::Insert, table_1_id))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(table_1_inserts.len(), 2);
+    let table_2_inserts = grouped
+        .get(&(EventType::Insert, table_2_id))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(table_2_inserts.len(), 1);
+    let table_3_inserts = grouped
+        .get(&(EventType::Insert, table_3_id))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(table_3_inserts.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn publication_for_all_tables_in_schema_ignores_new_tables_until_restart() {
     init_test_tracing();
 

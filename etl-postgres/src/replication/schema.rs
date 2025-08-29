@@ -1,5 +1,5 @@
 use sqlx::postgres::PgRow;
-use sqlx::postgres::types::Oid;
+use sqlx::postgres::types::Oid as SqlxTableId;
 use sqlx::{PgExecutor, PgPool, Row};
 use std::collections::HashMap;
 use tokio_postgres::types::Type as PgType;
@@ -232,7 +232,7 @@ pub async fn load_table_schemas(
     let mut table_schemas = HashMap::new();
 
     for row in rows {
-        let table_oid: Oid = row.get("table_id");
+        let table_oid: SqlxTableId = row.get("table_id");
         let table_id = TableId::new(table_oid.0);
         let schema_name: String = row.get("schema_name");
         let table_name: String = row.get("table_name");
@@ -251,7 +251,7 @@ pub async fn load_table_schemas(
 ///
 /// Removes all table schema records and associated columns for the specified
 /// pipeline, using CASCADE delete for automatic cleanup of related column records.
-pub async fn delete_pipeline_table_schemas<'c, E>(
+pub async fn delete_table_schemas_for_all_tables<'c, E>(
     executor: E,
     pipeline_id: i64,
 ) -> Result<u64, sqlx::Error>
@@ -265,6 +265,31 @@ where
         "#,
     )
     .bind(pipeline_id)
+    .execute(executor)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// Deletes the table schema for a specific table in a pipeline.
+///
+/// Also cascades to `etl.table_columns` via FK.
+pub async fn delete_table_schema_for_table<'c, E>(
+    executor: E,
+    pipeline_id: i64,
+    table_id: TableId,
+) -> Result<u64, sqlx::Error>
+where
+    E: PgExecutor<'c>,
+{
+    let result = sqlx::query(
+        r#"
+        delete from etl.table_schemas
+        where pipeline_id = $1 and table_id = $2
+        "#,
+    )
+    .bind(pipeline_id)
+    .bind(SqlxTableId(table_id.into_inner()))
     .execute(executor)
     .await?;
 
