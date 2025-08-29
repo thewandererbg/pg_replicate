@@ -16,7 +16,12 @@ use tracing::{debug, info};
 
 use crate::concurrency::shutdown::ShutdownRx;
 use crate::concurrency::signal::SignalRx;
-use crate::conversions::event::convert_message_to_event;
+use crate::conversions::event::{
+    parse_event_from_begin_message, parse_event_from_commit_message,
+    parse_event_from_delete_message, parse_event_from_insert_message,
+    parse_event_from_relation_message, parse_event_from_truncate_message,
+    parse_event_from_update_message,
+};
 use crate::destination::Destination;
 use crate::error::{ErrorKind, EtlError, EtlResult};
 use crate::metrics::{
@@ -26,7 +31,7 @@ use crate::replication::client::PgReplicationClient;
 use crate::replication::stream::EventsStream;
 use crate::state::table::{RetryPolicy, TableReplicationError};
 use crate::store::schema::SchemaStore;
-use crate::types::{Event, EventType, PipelineId};
+use crate::types::{Event, PipelineId};
 use crate::{bail, etl_error};
 
 /// The amount of milliseconds that pass between one refresh and the other of the system, in case no
@@ -100,9 +105,6 @@ struct StatusUpdate {
 
 impl StatusUpdate {
     /// Updates the write LSN to a higher value if the new LSN is greater.
-    ///
-    /// This method ensures LSN values only advance forward, preventing
-    /// regression in replication progress reporting to Postgres.
     fn update_write_lsn(&mut self, new_write_lsn: PgLsn) {
         if new_write_lsn <= self.write_lsn {
             return;
@@ -112,9 +114,6 @@ impl StatusUpdate {
     }
 
     /// Updates the flush LSN to a higher value if the new LSN is greater.
-    ///
-    /// This method tracks the highest LSN for data that has been durably
-    /// written to the destination, enabling Postgres WAL cleanup.
     fn update_flush_lsn(&mut self, flush_lsn: PgLsn) {
         if flush_lsn <= self.flush_lsn {
             return;
@@ -124,9 +123,6 @@ impl StatusUpdate {
     }
 
     /// Updates the apply LSN to a higher value if the new LSN is greater.
-    ///
-    /// This method tracks the highest LSN for data that has been successfully
-    /// applied to the destination system with all constraints satisfied.
     fn update_apply_lsn(&mut self, apply_lsn: PgLsn) {
         if apply_lsn <= self.apply_lsn {
             return;
@@ -597,6 +593,8 @@ where
             let start_lsn = PgLsn::from(message.wal_start());
             state.next_status_update.update_write_lsn(start_lsn);
 
+            // The `end_lsn` here is the LSN of the last byte in the WAL that was processed by the
+            // server, and it's different from the `end_lsn` found in the `Commit` message.
             let end_lsn = PgLsn::from(message.wal_end());
             state.next_status_update.update_write_lsn(end_lsn);
 
@@ -659,41 +657,61 @@ where
     S: SchemaStore + Clone + Send + 'static,
     T: ApplyLoopHook,
 {
-    // We perform the conversion of the message to our own event format which is used downstream
-    // by the destination.
-    //
-    // It's important to note that we use the `start_lsn` and `commit_lsn` as LSNs for tracking the
-    // position of the event in the WAL. The `start_lsn` defines total order within the WAL but with
-    // `commit_lsn` we can also encode information about the transaction order since we might have
-    // an entry with `start_lsn` greater than another but because logical replication sends transactions
-    // in the order of commit, the actual insert could happen before.
     let commit_lsn = get_commit_lsn(state, &message)?;
-    let event = convert_message_to_event(schema_store, start_lsn, commit_lsn, &message).await?;
 
-    let event_type = EventType::from(&event);
-    debug!("message converted to event type {}", event_type);
-
-    match message {
-        LogicalReplicationMessage::Begin(message) => {
-            handle_begin_message(state, event, &message).await
+    match &message {
+        LogicalReplicationMessage::Begin(begin_body) => {
+            handle_begin_message(state, start_lsn, commit_lsn, begin_body).await
         }
-        LogicalReplicationMessage::Commit(message) => {
-            handle_commit_message(state, event, &message, hook).await
+        LogicalReplicationMessage::Commit(commit_body) => {
+            handle_commit_message(state, start_lsn, commit_lsn, commit_body, hook).await
         }
-        LogicalReplicationMessage::Relation(message) => {
-            handle_relation_message(state, event, &message, schema_store, hook).await
+        LogicalReplicationMessage::Relation(relation_body) => {
+            handle_relation_message(
+                state,
+                start_lsn,
+                commit_lsn,
+                relation_body,
+                schema_store,
+                hook,
+            )
+            .await
         }
-        LogicalReplicationMessage::Insert(message) => {
-            handle_insert_message(state, event, &message, hook).await
+        LogicalReplicationMessage::Insert(insert_body) => {
+            handle_insert_message(
+                state,
+                start_lsn,
+                commit_lsn,
+                insert_body,
+                hook,
+                schema_store,
+            )
+            .await
         }
-        LogicalReplicationMessage::Update(message) => {
-            handle_update_message(state, event, &message, hook).await
+        LogicalReplicationMessage::Update(update_body) => {
+            handle_update_message(
+                state,
+                start_lsn,
+                commit_lsn,
+                update_body,
+                hook,
+                schema_store,
+            )
+            .await
         }
-        LogicalReplicationMessage::Delete(message) => {
-            handle_delete_message(state, event, &message, hook).await
+        LogicalReplicationMessage::Delete(delete_body) => {
+            handle_delete_message(
+                state,
+                start_lsn,
+                commit_lsn,
+                delete_body,
+                hook,
+                schema_store,
+            )
+            .await
         }
-        LogicalReplicationMessage::Truncate(message) => {
-            handle_truncate_message(state, event, &message, hook).await
+        LogicalReplicationMessage::Truncate(truncate_body) => {
+            handle_truncate_message(state, start_lsn, commit_lsn, truncate_body, hook).await
         }
         LogicalReplicationMessage::Origin(_) => Ok(HandleMessageResult::default()),
         LogicalReplicationMessage::Type(_) => Ok(HandleMessageResult::default()),
@@ -735,27 +753,20 @@ fn get_commit_lsn(state: &ApplyLoopState, message: &LogicalReplicationMessage) -
 /// all events within the transaction share the same commit boundary identifier.
 async fn handle_begin_message(
     state: &mut ApplyLoopState,
-    event: Event,
+    start_lsn: PgLsn,
+    commit_lsn: PgLsn,
     message: &protocol::BeginBody,
 ) -> EtlResult<HandleMessageResult> {
-    let EventType::Begin = event.event_type() else {
-        bail!(
-            ErrorKind::ValidationError,
-            "Invalid event",
-            format!(
-                "An invalid event {event:?} was received (expected {:?})",
-                EventType::Begin
-            )
-        );
-    };
-
     // We track the final lsn of this transaction, which should be equal to the `commit_lsn` of the
     // `Commit` message.
     let final_lsn = PgLsn::from(message.final_lsn());
     state.remote_final_lsn = Some(final_lsn);
 
+    // Convert event from the protocol message.
+    let event = parse_event_from_begin_message(start_lsn, commit_lsn, message);
+
     Ok(HandleMessageResult {
-        event: Some(event),
+        event: Some(Event::Begin(event)),
         end_lsn: None,
         end_batch: None,
         table_replication_error: None,
@@ -774,24 +785,14 @@ async fn handle_begin_message(
 /// sync workers reaching their target LSN).
 async fn handle_commit_message<T>(
     state: &mut ApplyLoopState,
-    event: Event,
+    start_lsn: PgLsn,
+    commit_lsn: PgLsn,
     message: &protocol::CommitBody,
     hook: &T,
 ) -> EtlResult<HandleMessageResult>
 where
     T: ApplyLoopHook,
 {
-    let EventType::Commit = event.event_type() else {
-        bail!(
-            ErrorKind::ValidationError,
-            "Invalid event",
-            format!(
-                "An invalid event {event:?} was received (expected {:?})",
-                EventType::Commit
-            )
-        );
-    };
-
     // We take the LSN that belongs to the current transaction, however, if there is no
     // LSN, it means that a `Begin` message was not received before this `Commit` which means
     // we are in an inconsistent state.
@@ -806,14 +807,14 @@ where
     // If the commit lsn of the message is different from the remote final lsn, it means that the
     // transaction that was started expect a different commit lsn in the commit message. In this case,
     // we want to bail assuming we are in an inconsistent state.
-    let commit_lsn = PgLsn::from(message.commit_lsn());
-    if commit_lsn != remote_final_lsn {
+    let commit_lsn_msg = PgLsn::from(message.commit_lsn());
+    if commit_lsn_msg != remote_final_lsn {
         bail!(
             ErrorKind::ValidationError,
             "Invalid commit LSN",
             format!(
                 "Incorrect commit LSN {} in COMMIT message (expected {})",
-                commit_lsn, remote_final_lsn
+                commit_lsn_msg, remote_final_lsn
             )
         );
     }
@@ -827,8 +828,11 @@ where
     // destination.
     let continue_loop = hook.process_syncing_tables(end_lsn, false).await?;
 
+    // Convert event from the protocol message.
+    let event = parse_event_from_commit_message(start_lsn, commit_lsn, message);
+
     let mut result = HandleMessageResult {
-        event: Some(event),
+        event: Some(Event::Commit(event)),
         // We mark this as the last commit end LSN since we want to be able to track from the outside
         // what was the biggest transaction boundary LSN which was successfully applied.
         //
@@ -863,7 +867,8 @@ where
 /// by failing fast on incompatible schema evolution.
 async fn handle_relation_message<S, T>(
     state: &mut ApplyLoopState,
-    event: Event,
+    start_lsn: PgLsn,
+    commit_lsn: PgLsn,
     message: &protocol::RelationBody,
     schema_store: &S,
     hook: &T,
@@ -872,17 +877,6 @@ where
     S: SchemaStore + Clone + Send + 'static,
     T: ApplyLoopHook,
 {
-    let Event::Relation(event) = event else {
-        bail!(
-            ErrorKind::ValidationError,
-            "Invalid event",
-            format!(
-                "An invalid event {event:?} was received (expected {:?})",
-                EventType::Relation
-            )
-        );
-    };
-
     let Some(remote_final_lsn) = state.remote_final_lsn else {
         bail!(
             ErrorKind::InvalidState,
@@ -914,6 +908,9 @@ where
                 )
             })?;
 
+    // Convert event from the protocol message.
+    let event = parse_event_from_relation_message(start_lsn, commit_lsn, message)?;
+
     // We compare the table schema from the relation message with the existing schema (if any).
     // The purpose of this comparison is that we want to throw an error and stop the processing
     // of any table that incurs in a schema change after the initial table sync is performed.
@@ -941,26 +938,18 @@ where
 }
 
 /// Handles Postgres INSERT messages for row insertion events.
-async fn handle_insert_message<T>(
+async fn handle_insert_message<S, T>(
     state: &mut ApplyLoopState,
-    event: Event,
+    start_lsn: PgLsn,
+    commit_lsn: PgLsn,
     message: &protocol::InsertBody,
     hook: &T,
+    schema_store: &S,
 ) -> EtlResult<HandleMessageResult>
 where
+    S: SchemaStore + Clone + Send + 'static,
     T: ApplyLoopHook,
 {
-    let Event::Insert(event) = event else {
-        bail!(
-            ErrorKind::ValidationError,
-            "Invalid event",
-            format!(
-                "An invalid event {event:?} was received (expected {:?})",
-                EventType::Insert
-            )
-        );
-    };
-
     let Some(remote_final_lsn) = state.remote_final_lsn else {
         bail!(
             ErrorKind::InvalidState,
@@ -976,6 +965,10 @@ where
         return Ok(HandleMessageResult::default());
     }
 
+    // Convert event from the protocol message.
+    let event =
+        parse_event_from_insert_message(schema_store, start_lsn, commit_lsn, message).await?;
+
     Ok(HandleMessageResult {
         event: Some(Event::Insert(event)),
         end_lsn: None,
@@ -985,26 +978,18 @@ where
 }
 
 /// Handles Postgres UPDATE messages for row modification events.
-async fn handle_update_message<T>(
+async fn handle_update_message<S, T>(
     state: &mut ApplyLoopState,
-    event: Event,
+    start_lsn: PgLsn,
+    commit_lsn: PgLsn,
     message: &protocol::UpdateBody,
     hook: &T,
+    schema_store: &S,
 ) -> EtlResult<HandleMessageResult>
 where
+    S: SchemaStore + Clone + Send + 'static,
     T: ApplyLoopHook,
 {
-    let Event::Update(event) = event else {
-        bail!(
-            ErrorKind::ValidationError,
-            "Invalid event",
-            format!(
-                "An invalid event {event:?} was received (expected {:?})",
-                EventType::Update
-            )
-        );
-    };
-
     let Some(remote_final_lsn) = state.remote_final_lsn else {
         bail!(
             ErrorKind::InvalidState,
@@ -1020,6 +1005,10 @@ where
         return Ok(HandleMessageResult::default());
     }
 
+    // Convert event from the protocol message.
+    let event =
+        parse_event_from_update_message(schema_store, start_lsn, commit_lsn, message).await?;
+
     Ok(HandleMessageResult {
         event: Some(Event::Update(event)),
         end_lsn: None,
@@ -1029,26 +1018,18 @@ where
 }
 
 /// Handles Postgres DELETE messages for row removal events.
-async fn handle_delete_message<T>(
+async fn handle_delete_message<S, T>(
     state: &mut ApplyLoopState,
-    event: Event,
+    start_lsn: PgLsn,
+    commit_lsn: PgLsn,
     message: &protocol::DeleteBody,
     hook: &T,
+    schema_store: &S,
 ) -> EtlResult<HandleMessageResult>
 where
+    S: SchemaStore + Clone + Send + 'static,
     T: ApplyLoopHook,
 {
-    let Event::Delete(event) = event else {
-        bail!(
-            ErrorKind::ValidationError,
-            "Invalid event",
-            format!(
-                "An invalid event {event:?} was received (expected {:?})",
-                EventType::Delete
-            )
-        );
-    };
-
     let Some(remote_final_lsn) = state.remote_final_lsn else {
         bail!(
             ErrorKind::InvalidState,
@@ -1063,6 +1044,10 @@ where
     {
         return Ok(HandleMessageResult::default());
     }
+
+    // Convert event from the protocol message.
+    let event =
+        parse_event_from_delete_message(schema_store, start_lsn, commit_lsn, message).await?;
 
     Ok(HandleMessageResult {
         event: Some(Event::Delete(event)),
@@ -1080,24 +1065,14 @@ where
 /// it evaluates each table individually.
 async fn handle_truncate_message<T>(
     state: &mut ApplyLoopState,
-    event: Event,
+    start_lsn: PgLsn,
+    commit_lsn: PgLsn,
     message: &protocol::TruncateBody,
     hook: &T,
 ) -> EtlResult<HandleMessageResult>
 where
     T: ApplyLoopHook,
 {
-    let Event::Truncate(mut event) = event else {
-        bail!(
-            ErrorKind::ValidationError,
-            "Invalid event",
-            format!(
-                "An invalid event {event:?} was received (expected {:?})",
-                EventType::Truncate
-            )
-        );
-    };
-
     let Some(remote_final_lsn) = state.remote_final_lsn else {
         bail!(
             ErrorKind::InvalidState,
@@ -1106,6 +1081,8 @@ where
         );
     };
 
+    // We collect only the relation ids for which we are allow to apply changes, thus in this case
+    // the truncation.
     let mut rel_ids = Vec::with_capacity(message.rel_ids().len());
     for &table_id in message.rel_ids().iter() {
         if hook
@@ -1115,7 +1092,13 @@ where
             rel_ids.push(table_id)
         }
     }
-    event.rel_ids = rel_ids;
+    // If nothing to apply, skip conversion entirely
+    if rel_ids.is_empty() {
+        return Ok(HandleMessageResult::default());
+    }
+
+    // Convert event from the protocol message.
+    let event = parse_event_from_truncate_message(start_lsn, commit_lsn, message, rel_ids);
 
     Ok(HandleMessageResult {
         event: Some(Event::Truncate(event)),
