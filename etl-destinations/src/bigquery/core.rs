@@ -4,7 +4,7 @@ use etl::store::schema::SchemaStore;
 use etl::store::state::StateStore;
 use etl::types::{Cell, Event, PgLsn, TableId, TableName, TableRow};
 use etl::{bail, etl_error};
-use gcp_bigquery_client::storage::{TableBatch, TableDescriptor};
+use gcp_bigquery_client::storage::TableDescriptor;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::iter;
@@ -14,7 +14,6 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::bigquery::client::{BigQueryClient, BigQueryOperationType};
-use crate::bigquery::encoding::BigQueryTableRow;
 use crate::bigquery::{BigQueryDatasetId, BigQueryTableId};
 use crate::metrics::register_metrics;
 
@@ -306,6 +305,9 @@ where
             .await?;
 
         // Optimistically skip table creation if we've already seen this sequenced table.
+        //
+        // Note that if the table is deleted outside ETL and the cache marks it as created, the
+        // inserts will fail because the table will be missing and won't be created.
         if !inner.created_tables.contains(&sequenced_bigquery_table_id) {
             self.client
                 .create_table_if_missing(
@@ -343,45 +345,6 @@ where
         Ok((sequenced_bigquery_table_id, Arc::new(table_descriptor)))
     }
 
-    /// Streams table batches to BigQuery concurrently without holding locks.
-    ///
-    /// This method can operate without locking because:
-    /// - The BigQuery client is thread-safe and uses internal buffering  
-    /// - Table preparation is completed before calling this method
-    /// - Multiple streaming operations can execute concurrently
-    async fn stream_table_batches_concurrent_with_fallback(
-        &self,
-        client: &BigQueryClient,
-        table_batches: Vec<TableBatch<BigQueryTableRow>>,
-        max_concurrent_streams: usize,
-    ) -> EtlResult<(usize, usize)> {
-        // First attempt - optimistically assume all tables exist
-        let result = client
-            .stream_table_batches_concurrent(table_batches, max_concurrent_streams)
-            .await;
-
-        match result {
-            Ok((bytes_sent, bytes_received)) => Ok((bytes_sent, bytes_received)),
-            Err(err) => {
-                // From our testing, when trying to send data to a missing table, this is the error that is
-                // returned:
-                // `Status { code: PermissionDenied, message: "Permission 'TABLES_UPDATE_DATA' denied on
-                // resource 'x' (or it may not exist).", source: None }`
-                //
-                // If we get permission denied, we assume that a table doesn't exist.
-                // For now, we'll return the error since reconstructing batches is complex
-                if err.kind() == ErrorKind::PermissionDenied {
-                    warn!("one or more tables not found during concurrent streaming");
-                    // TODO: figure out how we could get per-table errors here and try to recreate the
-                    //  tables.
-                    Err(err)
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    }
-
     /// Adds a table to the creation cache to avoid redundant existence checks.
     fn add_to_created_tables_cache(inner: &mut Inner, table_id: &SequencedBigQueryTableId) {
         if inner.created_tables.contains(table_id) {
@@ -389,11 +352,6 @@ where
         }
 
         inner.created_tables.insert(table_id.clone());
-    }
-
-    /// Removes a table from the creation cache when it's found to not exist.
-    fn remove_from_created_tables_cache(inner: &mut Inner, table_id: &SequencedBigQueryTableId) {
-        inner.created_tables.remove(table_id);
     }
 
     /// Retrieves the current sequenced table ID or creates a new one starting at version 0.
@@ -455,6 +413,7 @@ where
             .create_or_replace_view(&self.dataset_id, view_name, &target_table_id.to_string())
             .await?;
 
+        // We insert/overwrite the new (view -> sequenced bigquery table id) mapping
         inner
             .created_views
             .insert(view_name.clone(), target_table_id.clone());
@@ -507,11 +466,8 @@ where
         // Stream all the batches concurrently.
         if !table_batches.is_empty() {
             let (bytes_sent, bytes_received) = self
-                .stream_table_batches_concurrent_with_fallback(
-                    &self.client,
-                    table_batches,
-                    self.max_concurrent_streams,
-                )
+                .client
+                .stream_table_batches_concurrent(table_batches, self.max_concurrent_streams)
                 .await?;
 
             // Logs with egress_metric = true can be used to identify egress logs.
@@ -547,7 +503,6 @@ where
                 }
 
                 let event = event_iter.next().unwrap();
-
                 match event {
                     Event::Insert(mut insert) => {
                         let sequence_number =
@@ -594,6 +549,7 @@ where
                     }
                     _ => {
                         // Every other event type is currently not supported.
+                        debug!("skipping unsupported event in BigQuery");
                     }
                 }
             }
@@ -617,11 +573,8 @@ where
 
                 if !table_batches.is_empty() {
                     let (bytes_sent, bytes_received) = self
-                        .stream_table_batches_concurrent_with_fallback(
-                            &self.client,
-                            table_batches,
-                            self.max_concurrent_streams,
-                        )
+                        .client
+                        .stream_table_batches_concurrent(table_batches, self.max_concurrent_streams)
                         .await?;
 
                     // Logs with egress_metric = true can be used to identify egress logs.
@@ -766,7 +719,7 @@ where
             );
 
             // We remove the old table from the cache since it's no longer necessary.
-            Self::remove_from_created_tables_cache(&mut inner, &sequenced_bigquery_table_id);
+            inner.created_tables.remove(&sequenced_bigquery_table_id);
 
             // Schedule cleanup of the previous table. We do not care to track this task since
             // if it fails, users can clean up the table on their own, but the view will still point
