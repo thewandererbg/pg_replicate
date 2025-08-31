@@ -38,15 +38,17 @@ async fn main() -> anyhow::Result<()> {
             }
 
             Err(e) => {
-                let msg = e.to_string().to_lowercase();
-                let is_retryable = msg.contains("tls handshake eof")
-                    || msg.contains("client error (connect)")
-                    || msg.contains("connection reset")
-                    || msg.contains("broken pipe")
-                    || msg.contains("timeout")
-                    || msg.contains("deadline exceeded")
-                    || msg.contains("unavailable")
-                    || msg.contains("goaway");
+                let is_retryable = e.chain().any(|err| {
+                    let msg = err.to_string().to_lowercase();
+                    msg.contains("tls handshake eof")
+                        || msg.contains("client error (connect)")
+                        || msg.contains("connection reset")
+                        || msg.contains("broken pipe")
+                        || msg.contains("timeout")
+                        || msg.contains("deadline exceeded")
+                        || msg.contains("unavailable")
+                        || msg.contains("goaway")
+                });
 
                 if !is_retryable {
                     break Err(e);
