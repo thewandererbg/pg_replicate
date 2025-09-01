@@ -49,6 +49,9 @@ jobs:
     if: github.event.pull_request.head.repo.fork == true
     permissions:
       contents: read
+    strategy:
+      matrix:
+        postgres_version: [17, 16, 15, 14]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -61,9 +64,9 @@ jobs:
         with:
           key: test-partial
 
-      - name: Start Docker Compose Environment
+      - name: Start Docker Compose Environment (Postgres ${{ matrix.postgres_version }})
         run: |
-          docker compose -f ./scripts/docker-compose.yaml up -d
+          POSTGRES_VERSION=${{ matrix.postgres_version }} docker compose -f ./scripts/docker-compose.yaml up -d
 
       - name: Install sqlx-cli
         run: |
@@ -96,6 +99,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    strategy:
+      matrix:
+        postgres_version: [17, 16, 15, 14]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -108,9 +114,9 @@ jobs:
         with:
           key: test-full
 
-      - name: Start Docker Compose Environment
+      - name: Start Docker Compose Environment (Postgres ${{ matrix.postgres_version }})
         run: |
-          docker compose -f ./scripts/docker-compose.yaml up -d
+          POSTGRES_VERSION=${{ matrix.postgres_version }} docker compose -f ./scripts/docker-compose.yaml up -d
 
       - name: Install sqlx-cli
         run: |
