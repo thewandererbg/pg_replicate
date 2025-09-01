@@ -1,5 +1,4 @@
 use crate::core::start_replicator;
-use std::io::{Error, ErrorKind};
 use std::time::{Duration, Instant};
 use telemetry::init_tracing;
 use tracing::{error, warn};
@@ -38,28 +37,21 @@ async fn main() -> anyhow::Result<()> {
             }
 
             Err(e) => {
-                let is_retryable =
-                    e.chain()
-                        .filter_map(|err| err.downcast_ref::<Error>())
-                        .any(|io_err| {
-                            matches!(
-                                io_err.kind(),
-                                ErrorKind::ConnectionRefused
-                                    | ErrorKind::ConnectionReset
-                                    | ErrorKind::ConnectionAborted
-                                    | ErrorKind::TimedOut
-                                    | ErrorKind::UnexpectedEof
-                                    | ErrorKind::BrokenPipe
-                                    | ErrorKind::NotConnected
-                                    | ErrorKind::NetworkUnreachable
-                                    | ErrorKind::HostUnreachable
-                            )
-                        });
+                let msg = format!("{:#}", e).to_lowercase();
+                let is_retryable = msg.contains("client error (connect)")
+                    || msg.contains("tls handshake eof")
+                    || msg.contains("connection reset")
+                    || msg.contains("broken pipe")
+                    || msg.contains("timeout")
+                    || msg.contains("deadline exceeded")
+                    || msg.contains("unavailable")
+                    || msg.contains("goaway");
 
                 if !is_retryable {
-                    warn!("Non retryable error: {}", e);
+                    warn!("Non retryable error: {:#}", e);
                     break Err(e);
                 }
+
                 // reset if it ran ok for ≥ 1hour
                 if ran_for >= Duration::from_secs(RESET_THRESHOLD) {
                     backoff_secs = INITIAL_BACKOFF;
