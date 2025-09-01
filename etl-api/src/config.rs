@@ -1,4 +1,5 @@
 use base64::{Engine, prelude::BASE64_STANDARD};
+use etl_config::Config;
 use etl_config::shared::{PgConnectionConfig, SentryConfig};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, de};
@@ -20,10 +21,16 @@ pub struct ApiConfig {
     pub application: ApplicationSettings,
     /// Encryption key configuration.
     pub encryption_key: EncryptionKey,
-    /// Base64-encoded API key string.
-    pub api_key: String,
+    /// List of base64-encoded API keys.
+    ///
+    /// All keys in this list are considered valid for authentication.
+    pub api_keys: Vec<String>,
     /// Optional Sentry configuration for error tracking.
     pub sentry: Option<SentryConfig>,
+}
+
+impl Config for ApiConfig {
+    const LIST_PARSE_KEYS: &'static [&'static str] = &["api_keys"];
 }
 
 /// HTTP server configuration settings.
