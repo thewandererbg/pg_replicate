@@ -149,6 +149,15 @@ async fn publication_changes_are_correctly_handled() {
 
     let database = spawn_source_database().await;
 
+    if let Some(server_version) = database.server_version()
+        && server_version.get() <= 150000
+    {
+        println!(
+            "Skipping test for PostgreSQL version <= 15, CREATE PUBLICATION FOR TABLES IN SCHEMA is not supported"
+        );
+        return;
+    }
+
     // Create two tables in the test schema and a publication for that schema.
     let table_1 = test_table_name("table_1");
     let table_1_id = database
@@ -192,15 +201,6 @@ async fn publication_changes_are_correctly_handled() {
     table_1_done.notified().await;
     table_2_done.notified().await;
 
-    if let Some(server_version) = database.server_version()
-        && server_version.get() <= 150000
-    {
-        println!(
-            "Skipping test for PostgreSQL version <= 15, CREATE PUBLICATION FOR TABLES IN SCHEMA is not supported"
-        );
-        return;
-    }
-
     // Insert one row in each table and wait for two insert events.
     let inserts_notify = destination
         .wait_for_events_count(vec![(EventType::Insert, 2)])
@@ -215,10 +215,7 @@ async fn publication_changes_are_correctly_handled() {
         .unwrap();
     inserts_notify.notified().await;
 
-    // Shutdown pipeline before altering publication (by dropping one table)
-    pipeline.shutdown_and_wait().await.unwrap();
-
-    // Drop table_2 so it's no longer part of the publication
+    // Drop table_2 so it's no longer part of the publication.
     database
         .client
         .as_ref()
@@ -229,6 +226,10 @@ async fn publication_changes_are_correctly_handled() {
         )
         .await
         .unwrap();
+
+    // Shutdown pipeline after the table was dropped. We do this to show that the dropping of a table
+    // doesn't cause issues with the pipeline since the change is picked up on pipeline restart.
+    pipeline.shutdown_and_wait().await.unwrap();
 
     // Create table_3 which is going to be added to the publication.
     let table_3 = test_table_name("table_3");
@@ -258,7 +259,7 @@ async fn publication_changes_are_correctly_handled() {
     // Insert one row in table_1 and wait for it. (We wait for 4 inserts since it keeps the previous
     // ones).
     let inserts_notify = destination
-        .wait_for_events_count(vec![(EventType::Insert, 4)])
+        .wait_for_events_count_deduped(vec![(EventType::Insert, 4)])
         .await;
 
     database
@@ -274,7 +275,7 @@ async fn publication_changes_are_correctly_handled() {
 
     pipeline.shutdown_and_wait().await.unwrap();
 
-    // Assert that table_2 state is gone but destination data remains
+    // Assert that table_2 state is gone but destination data remains.
     let states = store.get_table_replication_states().await;
     assert!(states.contains_key(&table_1_id));
     assert!(!states.contains_key(&table_2_id));
@@ -282,22 +283,24 @@ async fn publication_changes_are_correctly_handled() {
 
     // The destination should have the 2 events of the first table, the 1 event of the removed table
     // and the 1 event of the new table.
-    let events = destination.get_events().await;
+    // Use de-duplicated events for assertions to be robust to potential duplicates
+    // on restart where confirmed_flush_lsn may not have been stored.
+    let events = destination.get_events_deduped().await;
     let grouped = group_events_by_type_and_table_id(&events);
     let table_1_inserts = grouped
         .get(&(EventType::Insert, table_1_id))
         .cloned()
-        .unwrap_or_default();
+        .unwrap();
     assert_eq!(table_1_inserts.len(), 2);
     let table_2_inserts = grouped
         .get(&(EventType::Insert, table_2_id))
         .cloned()
-        .unwrap_or_default();
+        .unwrap();
     assert_eq!(table_2_inserts.len(), 1);
     let table_3_inserts = grouped
         .get(&(EventType::Insert, table_3_id))
         .cloned()
-        .unwrap_or_default();
+        .unwrap();
     assert_eq!(table_3_inserts.len(), 1);
 }
 
@@ -306,6 +309,15 @@ async fn publication_for_all_tables_in_schema_ignores_new_tables_until_restart()
     init_test_tracing();
 
     let database = spawn_source_database().await;
+
+    if let Some(server_version) = database.server_version()
+        && server_version.get() <= 150000
+    {
+        println!(
+            "Skipping test for PostgreSQL version <= 15, CREATE PUBLICATION FOR TABLES IN SCHEMA is not supported"
+        );
+        return;
+    }
 
     // Create first table.
     let table_1 = test_table_name("table_1");
@@ -363,15 +375,6 @@ async fn publication_for_all_tables_in_schema_ignores_new_tables_until_restart()
     assert_eq!(table_schemas.len(), 1);
     assert!(table_schemas.contains_key(&table_1_id));
     assert!(!table_schemas.contains_key(&table_2_id));
-
-    if let Some(server_version) = database.server_version()
-        && server_version.get() <= 150000
-    {
-        println!(
-            "Skipping test for PostgreSQL version <= 15, CREATE PUBLICATION FOR TABLES IN SCHEMA is not supported"
-        );
-        return;
-    }
 
     // We restart the pipeline and verify that the new table is now processed.
     let mut pipeline = create_pipeline(
