@@ -2,7 +2,6 @@
 name = "etl"
 version = "0.1.0"
 edition = "2024"
-autotests = false
 
 [features]
 unknown-types-to-bytes = []
@@ -50,13 +49,3 @@ etl-postgres = { workspace = true, features = [
 etl-telemetry = { workspace = true }
 
 rand = { workspace = true, features = ["thread_rng"] }
-
-[[test]]
-name = "integration"
-path = "tests/integration/mod.rs"
-required-features = ["test-utils"]
-
-[[test]]
-name = "failpoints"
-path = "tests/failpoints/mod.rs"
-required-features = ["failpoints", "test-utils"]
