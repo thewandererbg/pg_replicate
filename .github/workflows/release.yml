@@ -1,0 +1,100 @@
+name: Release
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 1.2.3)"
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Determine Version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Extract Tag and Version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            RAW="${{ inputs.version }}"
+            TAG="v${RAW#v}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            RAW="${TAG#v}"
+          fi
+          CLEANED="${RAW#v}"
+          if [[ ! "$CLEANED" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version: $CLEANED" >&2
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${CLEANED}" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    name: Build and Push Docker Images
+    needs: version
+    strategy:
+      matrix:
+        image: [etl-api, etl-replicator]
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      image: docker.io/${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image }}
+      context: ./${{ matrix.image }}
+      push: true
+      tag_with_version: true
+      version: ${{ needs.version.outputs.version }}
+    secrets: inherit
+
+  github-release:
+    name: Create GitHub Release
+    needs: [version, build-and-push]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Release Notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          USER="${{ vars.DOCKERHUB_USERNAME }}"
+          TAG="${{ needs.version.outputs.tag }}"
+          {
+            echo "body<<'MARKER'"
+            echo "Release ${TAG}"
+            echo
+            echo "Docker images published:"
+            echo "- docker.io/${USER}/etl-api:latest"
+            echo "- docker.io/${USER}/etl-api:${TAG}"
+            echo "- docker.io/${USER}/etl-replicator:latest"
+            echo "- docker.io/${USER}/etl-replicator:${TAG}"
+            echo
+            echo "View on Docker Hub:"
+            echo "- https://hub.docker.com/r/${USER}/etl-api"
+            echo "- https://hub.docker.com/r/${USER}/etl-replicator"
+            echo "MARKER"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: Release ${{ needs.version.outputs.tag }}
+          body: ${{ steps.notes.outputs.body }}
+          draft: false
+          prerelease: false
