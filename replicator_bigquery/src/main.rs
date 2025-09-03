@@ -36,23 +36,8 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            Err(e) => {
-                let msg = format!("{:#}", e).to_lowercase();
-                let is_retryable = msg.contains("client error (connect)")
-                    || msg.contains("tls handshake eof")
-                    || msg.contains("connection reset")
-                    || msg.contains("broken pipe")
-                    || msg.contains("timeout")
-                    || msg.contains("deadline exceeded")
-                    || msg.contains("unavailable")
-                    || msg.contains("goaway");
-
-                if !is_retryable {
-                    warn!("Non retryable error: {:#}", e);
-                    break Err(e);
-                }
-
-                // reset if it ran ok for ≥ 1hour
+            Err(e) if e.to_string().contains("destination error") => {
+                // reset if it ran ok for ≥ RESET_THRESHOLD minutes
                 if ran_for >= Duration::from_secs(RESET_THRESHOLD) {
                     backoff_secs = INITIAL_BACKOFF;
                     total_backoff_time = 0;
@@ -61,19 +46,24 @@ async fn main() -> anyhow::Result<()> {
                 total_backoff_time += backoff_secs;
                 if total_backoff_time >= MAX_BACKOFF_TIME {
                     error!(
-                        "Connection failures persisted for {} seconds, giving up",
+                        "Destination errors persisted for {} seconds, giving up",
                         total_backoff_time
                     );
                     break Err(e);
                 }
 
                 warn!(
-                    "Connection failure, retrying in {}s (total backoff: {}s)",
-                    backoff_secs, total_backoff_time
+                    "Destination error, retrying in {}s (total backoff: {}s): {:#}",
+                    backoff_secs, total_backoff_time, e
                 );
                 tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                 backoff_secs = (backoff_secs * 2).min(300);
                 continue;
+            }
+
+            Err(e) => {
+                warn!("Non retryable error: {:#}", e);
+                break Err(e);
             }
         }
     }
