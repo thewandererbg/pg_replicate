@@ -31,6 +31,7 @@ use crate::k8s_client::{RESTARTED_AT_ANNOTATION_KEY, TRUSTED_ROOT_CERT_KEY_NAME}
 use crate::routes::{
     ErrorMessage, TenantIdError, connect_to_source_database_with_defaults, extract_tenant_id,
 };
+use crate::utils::parse_docker_image_tag;
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
@@ -366,6 +367,23 @@ pub enum PipelineStatus {
     Started,
     Unknown,
     Failed,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PipelineVersion {
+    #[schema(example = 1)]
+    pub id: i64,
+    #[schema(example = "1.2.3")]
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetPipelineVersionResponse {
+    #[schema(example = 1)]
+    pub pipeline_id: i64,
+    pub version: PipelineVersion,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_version: Option<PipelineVersion>,
 }
 
 #[utoipa::path(
@@ -708,6 +726,66 @@ pub async fn stop_all_pipelines(
     txn.commit().await?;
 
     Ok(HttpResponse::Ok().finish())
+}
+
+#[utoipa::path(
+    summary = "Get pipeline version",
+    description = "Returns the current version for the pipeline and an optional new default version.",
+    params(
+        ("pipeline_id" = i64, Path, description = "Unique ID of the pipeline"),
+        ("tenant_id" = String, Header, description = "Tenant ID used to scope the request")
+    ),
+    responses(
+        (status = 200, description = "Pipeline version retrieved successfully", body = GetPipelineVersionResponse),
+        (status = 404, description = "Pipeline not found", body = ErrorMessage),
+        (status = 500, description = "Internal server error", body = ErrorMessage)
+    ),
+    tag = "Pipelines"
+)]
+#[get("/pipelines/{pipeline_id}/version")]
+pub async fn get_pipeline_version(
+    req: HttpRequest,
+    pool: Data<PgPool>,
+    pipeline_id: Path<i64>,
+) -> Result<impl Responder, PipelineError> {
+    let tenant_id = extract_tenant_id(&req)?;
+    let pipeline_id = pipeline_id.into_inner();
+
+    let mut txn = pool.begin().await?;
+
+    let replicator =
+        db::replicators::read_replicator_by_pipeline_id(txn.deref_mut(), tenant_id, pipeline_id)
+            .await?
+            .ok_or(PipelineError::ReplicatorNotFound(pipeline_id))?;
+
+    let current_image = db::images::read_image_by_replicator_id(txn.deref_mut(), replicator.id)
+        .await?
+        .ok_or(PipelineError::ImageNotFound(replicator.id))?;
+
+    let default_image = db::images::read_default_image(txn.deref_mut()).await?;
+
+    txn.commit().await?;
+
+    let current_version = PipelineVersion {
+        id: current_image.id,
+        name: parse_docker_image_tag(&current_image.name),
+    };
+
+    let new_version = match default_image {
+        Some(default_image) if default_image.id != current_image.id => Some(PipelineVersion {
+            id: default_image.id,
+            name: parse_docker_image_tag(&default_image.name),
+        }),
+        _ => None,
+    };
+
+    let response = GetPipelineVersionResponse {
+        pipeline_id,
+        version: current_version,
+        new_version,
+    };
+
+    Ok(Json(response))
 }
 
 #[utoipa::path(
