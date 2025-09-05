@@ -24,6 +24,7 @@ pub async fn create_image_with_name(app: &TestApp, name: String, is_default: boo
         .json()
         .await
         .expect("failed to deserialize response");
+
     response.id
 }
 
@@ -258,18 +259,19 @@ pub mod pipelines {
         destination_id: i64,
         config: FullApiPipelineConfig,
     ) -> i64 {
-        // Ensure there is a default image available.
-        super::create_default_image(app).await;
         let pipeline = CreatePipelineRequest {
             source_id,
             destination_id,
             config,
         };
         let response = app.create_pipeline(tenant_id, &pipeline).await;
+        assert!(response.status().is_success(), "failed to created pipeline");
+
         let response: CreatePipelineResponse = response
             .json()
             .await
             .expect("failed to deserialize response");
+
         response.id
     }
 }

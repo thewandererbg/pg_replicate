@@ -95,8 +95,8 @@ pub enum PipelineError {
     #[error("A pipeline already exists for this source and destination combination")]
     DuplicatePipeline,
 
-    #[error("The specified image with id {0} was not found")]
-    ImageNotFoundById(i64),
+    #[error("The specified image id {0} does not match the default image id")]
+    ImageIdNotDefault(i64),
 
     #[error("There was an error while looking up table information in the source database: {0}")]
     TableLookup(#[from] TableLookupError),
@@ -152,13 +152,14 @@ impl ResponseError for PipelineError {
             | PipelineError::TableLookup(_)
             | PipelineError::InvalidTableReplicationState(_)
             | PipelineError::MissingTableReplicationState => StatusCode::INTERNAL_SERVER_ERROR,
-            PipelineError::NotRollbackable(_) => StatusCode::BAD_REQUEST,
             PipelineError::PipelineNotFound(_)
-            | PipelineError::ImageNotFoundById(_)
-            | PipelineError::EtlStateNotInitialized => StatusCode::NOT_FOUND,
-            PipelineError::TenantId(_)
-            | PipelineError::SourceNotFound(_)
-            | PipelineError::DestinationNotFound(_) => StatusCode::BAD_REQUEST,
+            | PipelineError::EtlStateNotInitialized
+            | PipelineError::ImageIdNotDefault(_)
+            | PipelineError::DestinationNotFound(_)
+            | PipelineError::SourceNotFound(_) => StatusCode::NOT_FOUND,
+            PipelineError::TenantId(_) | PipelineError::NotRollbackable(_) => {
+                StatusCode::BAD_REQUEST
+            }
             PipelineError::DuplicatePipeline => StatusCode::CONFLICT,
         }
     }
@@ -237,9 +238,9 @@ pub struct ReadPipelinesResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct UpdatePipelineImageRequest {
-    #[schema(example = 1)]
-    pub image_id: Option<i64>,
+pub struct UpdatePipelineVersionRequest {
+    #[schema(example = 1, required = true)]
+    pub version_id: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1044,29 +1045,29 @@ pub async fn rollback_table_state(
 }
 
 #[utoipa::path(
-    summary = "Update pipeline image",
-    description = "Updates the pipeline's container image while preserving its state.",
-    request_body = UpdatePipelineImageRequest,
+    summary = "Update pipeline version",
+    description = "Updates the pipeline's version while preserving its state.",
+    request_body = UpdatePipelineVersionRequest,
     params(
         ("pipeline_id" = i64, Path, description = "Unique ID of the pipeline"),
         ("tenant_id" = String, Header, description = "Tenant ID used to scope the request")
     ),
     responses(
-        (status = 200, description = "Pipeline image updated successfully"),
+        (status = 200, description = "Pipeline version updated successfully"),
         (status = 400, description = "Bad request or pipeline not running", body = ErrorMessage),
-        (status = 404, description = "Pipeline or image not found", body = ErrorMessage),
+        (status = 404, description = "Pipeline or version not found", body = ErrorMessage),
         (status = 500, description = "Internal server error", body = ErrorMessage)
     ),
     tag = "Pipelines"
 )]
-#[post("/pipelines/{pipeline_id}/update-image")]
-pub async fn update_pipeline_image(
+#[post("/pipelines/{pipeline_id}/update-version")]
+pub async fn update_pipeline_version(
     req: HttpRequest,
     pool: Data<PgPool>,
     encryption_key: Data<EncryptionKey>,
     k8s_client: Data<dyn K8sClient>,
     pipeline_id: Path<i64>,
-    update_request: Json<UpdatePipelineImageRequest>,
+    update_request: Json<UpdatePipelineVersionRequest>,
 ) -> Result<impl Responder, PipelineError> {
     let tenant_id = extract_tenant_id(&req)?;
     let pipeline_id = pipeline_id.into_inner();
@@ -1077,14 +1078,18 @@ pub async fn update_pipeline_image(
     let (pipeline, replicator, current_image, source, destination) =
         read_all_required_data(&mut txn, tenant_id, pipeline_id, &encryption_key).await?;
 
-    let target_image = match update_request.image_id {
-        Some(image_id) => db::images::read_image(txn.deref_mut(), image_id)
-            .await?
-            .ok_or(PipelineError::ImageNotFoundById(image_id))?,
-        None => db::images::read_default_image(txn.deref_mut())
-            .await?
-            .ok_or(PipelineError::NoDefaultImageFound)?,
-    };
+    // Only allow updating to the current default image. The client must provide the version id and
+    // it must match the default version id. If it does not, we consider this a race condition and we
+    // fail the update.
+    let default_image = db::images::read_default_image(txn.deref_mut())
+        .await?
+        .ok_or(PipelineError::NoDefaultImageFound)?;
+
+    if update_request.version_id != default_image.id {
+        return Err(PipelineError::ImageIdNotDefault(update_request.version_id));
+    }
+
+    let target_image = default_image;
 
     // If the image ids are different, we change the database entry.
     if target_image.id != current_image.id {
