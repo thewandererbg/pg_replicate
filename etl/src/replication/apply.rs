@@ -3,7 +3,7 @@ use etl_postgres::replication::slots::get_slot_name;
 use etl_postgres::replication::worker::WorkerType;
 use etl_postgres::types::TableId;
 use futures::{FutureExt, StreamExt};
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use postgres_replication::protocol;
 use postgres_replication::protocol::{LogicalReplicationMessage, ReplicationMessage};
 use std::future::{Future, pending};
@@ -25,7 +25,8 @@ use crate::conversions::event::{
 use crate::destination::Destination;
 use crate::error::{ErrorKind, EtlError, EtlResult};
 use crate::metrics::{
-    ETL_APPLY_EVENTS_COPIED_TOTAL, ETL_BATCH_SEND_MILLISECONDS_TOTAL, ETL_BATCH_SIZE,
+    APPLY, ETL_BATCH_SEND_DURATION_SECONDS, ETL_BATCH_SIZE, ETL_ITEMS_COPIED_TOTAL, MILLIS_PER_SEC,
+    PHASE,
 };
 use crate::replication::client::PgReplicationClient;
 use crate::replication::stream::EventsStream;
@@ -510,10 +511,10 @@ where
 
             destination.write_events(events_batch).await?;
 
-            counter!(ETL_APPLY_EVENTS_COPIED_TOTAL).increment(num_events as u64);
+            counter!(ETL_ITEMS_COPIED_TOTAL, PHASE => APPLY).increment(num_events as u64);
             gauge!(ETL_BATCH_SIZE).set(num_events as f64);
-            let time_taken_to_send = before_sending.elapsed().as_millis();
-            gauge!(ETL_BATCH_SEND_MILLISECONDS_TOTAL).set(time_taken_to_send as f64);
+            let send_duration_secs = before_sending.elapsed().as_millis() as f64 / MILLIS_PER_SEC;
+            histogram!(ETL_BATCH_SEND_DURATION_SECONDS, PHASE => APPLY).record(send_duration_secs);
 
             state.last_batch_send_time = Instant::now();
         }
