@@ -27,7 +27,7 @@ use crate::destination::Destination;
 use crate::error::{ErrorKind, EtlError, EtlResult};
 use crate::metrics::{
     APPLY, ETL_BATCH_SEND_DURATION_SECONDS, ETL_BATCH_SIZE, ETL_ITEMS_COPIED_TOTAL, MILLIS_PER_SEC,
-    PHASE,
+    PHASE, PIPELINE_ID,
 };
 use crate::replication::client::PgReplicationClient;
 use crate::replication::stream::EventsStream;
@@ -454,6 +454,7 @@ where
                     &destination,
                     &hook,
                     config.batch.max_size,
+                    pipeline_id
                 )
                 .await?;
                 if !continue_loop {
@@ -513,6 +514,7 @@ where
 ///
 /// This function performs synchronization under the assumption that transaction boundary events are
 /// always processed and never skipped.
+#[expect(clippy::too_many_arguments)]
 async fn handle_replication_message_with_timeout<S, D, T>(
     state: &mut ApplyLoopState,
     mut events_stream: Pin<&mut TimeoutEventsStream>,
@@ -521,6 +523,7 @@ async fn handle_replication_message_with_timeout<S, D, T>(
     destination: &D,
     hook: &T,
     max_batch_size: usize,
+    pipeline_id: PipelineId,
 ) -> EtlResult<bool>
 where
     S: SchemaStore + Clone + Send + 'static,
@@ -558,7 +561,14 @@ where
                 // we don't produce any events to the destination but downstream code treats it as if
                 // those evets are "persisted".
                 if !state.events_batch.is_empty() {
-                    send_batch(state, events_stream.as_mut(), destination, max_batch_size).await?;
+                    send_batch(
+                        state,
+                        events_stream.as_mut(),
+                        destination,
+                        max_batch_size,
+                        pipeline_id,
+                    )
+                    .await?;
                 }
 
                 // If we have a caught table error, we want to mark the table as errored.
@@ -599,7 +609,14 @@ where
 
             if !state.events_batch.is_empty() {
                 // We send the non-empty batch.
-                send_batch(state, events_stream.as_mut(), destination, max_batch_size).await?;
+                send_batch(
+                    state,
+                    events_stream.as_mut(),
+                    destination,
+                    max_batch_size,
+                    pipeline_id,
+                )
+                .await?;
             }
 
             // We perform synchronization, to make sure that tables are synced.
@@ -618,6 +635,7 @@ async fn send_batch<D>(
     events_stream: Pin<&mut TimeoutEventsStream>,
     destination: &D,
     max_batch_size: usize,
+    pipeline_id: PipelineId,
 ) -> EtlResult<()>
 where
     D: Destination + Clone + Send + 'static,
@@ -635,11 +653,12 @@ where
 
     destination.write_events(events_batch).await?;
 
-    counter!(ETL_ITEMS_COPIED_TOTAL, PHASE => APPLY).increment(batch_size as u64);
-    gauge!(ETL_BATCH_SIZE).set(batch_size as f64);
+    counter!(ETL_ITEMS_COPIED_TOTAL, PIPELINE_ID => pipeline_id.to_string(), PHASE => APPLY)
+        .increment(batch_size as u64);
+    gauge!(ETL_BATCH_SIZE, PIPELINE_ID => pipeline_id.to_string()).set(batch_size as f64);
 
     let send_duration_secs = before_sending.elapsed().as_millis() as f64 / MILLIS_PER_SEC;
-    histogram!(ETL_BATCH_SEND_DURATION_SECONDS, PHASE => APPLY).record(send_duration_secs);
+    histogram!(ETL_BATCH_SEND_DURATION_SECONDS, PIPELINE_ID => pipeline_id.to_string(), PHASE => APPLY).record(send_duration_secs);
 
     // We tell the stream to reset the timer when it is polled the next time, this way the deadline
     // is restarted.
