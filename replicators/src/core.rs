@@ -276,8 +276,7 @@ async fn init_destinations_with_configs(
                 )
                 .await?;
 
-                let batch_config =
-                    BatchConfig::from_destination_config(batch.max_size, batch.max_fill_ms);
+                let batch_config = BatchConfig::from_config(batch.max_size, batch.max_fill_ms);
                 let destination_id = format!("bigquery_{}", index);
 
                 destinations_with_configs.push((
@@ -310,8 +309,7 @@ async fn init_destinations_with_configs(
                 )
                 .await?;
 
-                let batch_config =
-                    BatchConfig::from_destination_config(batch.max_size, batch.max_fill_ms);
+                let batch_config = BatchConfig::from_config(batch.max_size, batch.max_fill_ms);
                 let destination_id = format!("clickhouse_{}", index);
 
                 destinations_with_configs.push((

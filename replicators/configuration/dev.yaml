@@ -1,3 +1,6 @@
+pipeline:
+  id: 1
+  publication_name: "bqpub"
 source:
   host: "172.17.0.1"
   port: 5432
@@ -16,17 +19,14 @@ destinations:
       password: "password"
       batch:
         max_size: 100000
-        max_fill_ms: 10000
+        max_fill_ms: 60000
   - big_query:
-      project_id: "my-project"
-      dataset_id: "my_dataset"
-      gcp_sa_key_path: "/path/to/credentials.json"
-      max_staleness_mins: 60
+      project_id: "vigo-riders"
+      dataset_id: "dmsin_test"
+      gcp_sa_key_path: "./key_bq.json"
+      max_staleness_mins: 0
       batch:
         max_size: 100000
         max_fill_ms: 10000
 state_store:
   memory:
-pipeline:
-  id: 1
-  publication_name: "bqpub"
