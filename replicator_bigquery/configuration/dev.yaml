@@ -8,7 +8,7 @@ source:
   tls:
     trusted_root_certs: ""
     enabled: false
-destination:
+destinations:
   big_query:
     project_id: "vigo-riders"
     dataset_id: "dmsin_test"

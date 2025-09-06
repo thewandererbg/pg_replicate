@@ -1,0 +1,8 @@
+services:
+  server:
+    build:
+      context: ..s
+      dockerfile: replicators/Dockerfile
+    container_name: "replicators"
+    volumes:
+      - ./configuration:/app/configuration:Z

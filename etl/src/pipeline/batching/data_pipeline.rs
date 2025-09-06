@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures::{future::try_join_all, StreamExt};
 use postgres::schema::TableId;
 use std::sync::Arc;
 use std::{collections::HashSet, time::Instant};
@@ -34,7 +34,7 @@ impl BatchDataPipelineHandle {
 
 pub struct BatchDataPipeline<Src: Source, Dst: BatchDestination> {
     source: Src,
-    destination: Dst,
+    destinations: Vec<Dst>,
     action: PipelineAction,
     batch_config: BatchConfig,
     copy_tables_stream_stop: Arc<Notify>,
@@ -44,13 +44,13 @@ pub struct BatchDataPipeline<Src: Source, Dst: BatchDestination> {
 impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
     pub fn new(
         source: Src,
-        destination: Dst,
+        destinations: Vec<Dst>,
         action: PipelineAction,
         batch_config: BatchConfig,
     ) -> Self {
         BatchDataPipeline {
             source,
-            destination,
+            destinations,
             action,
             batch_config,
             copy_tables_stream_stop: Arc::new(Notify::new()),
@@ -63,8 +63,14 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
         let table_schemas = table_schemas.clone();
 
         if !table_schemas.is_empty() {
-            self.destination
-                .write_table_schemas(table_schemas)
+            // Write table schemas to all destinations in parallel
+            let schema_futures: Vec<_> = self
+                .destinations
+                .iter_mut()
+                .map(|dest| dest.write_table_schemas(table_schemas.clone()))
+                .collect();
+
+            try_join_all(schema_futures)
                 .await
                 .map_err(PipelineError::Destination)?;
         }
@@ -89,8 +95,14 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                 continue;
             }
 
-            self.destination
-                .truncate_table(table_schema.id)
+            // Truncate table on all destinations in parallel
+            let truncate_futures: Vec<_> = self
+                .destinations
+                .iter_mut()
+                .map(|dest| dest.truncate_table(table_schema.id))
+                .collect();
+
+            try_join_all(truncate_futures)
                 .await
                 .map_err(PipelineError::Destination)?;
 
@@ -115,17 +127,31 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                 for row in batch {
                     rows.push(row.map_err(CommonSourceError::TableCopyStream)?);
                 }
-                self.destination
-                    .write_table_rows(rows, table_schema.id)
+
+                // Write rows to all destinations in parallel
+                let write_futures: Vec<_> = self
+                    .destinations
+                    .iter_mut()
+                    .map(|dest| dest.write_table_rows(rows.clone(), table_schema.id))
+                    .collect();
+
+                try_join_all(write_futures)
                     .await
                     .map_err(PipelineError::Destination)?;
             }
 
-            self.destination
-                .table_copied(table_schema.id)
+            // Mark table as copied on all destinations in parallel
+            let copied_futures: Vec<_> = self
+                .destinations
+                .iter_mut()
+                .map(|dest| dest.table_copied(table_schema.id))
+                .collect();
+
+            try_join_all(copied_futures)
                 .await
                 .map_err(PipelineError::Destination)?;
         }
+
         self.source
             .commit_transaction()
             .await
@@ -188,14 +214,19 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                                 events.push(event);
                             }
 
-                            // Wrap write operation with ping mechanism to prevent timeout during long writes
-                            let write_future = self.destination.write_cdc_events(events);
+                            // Write to all destinations in parallel with ping mechanism
+                            let write_futures: Vec<_> = self.destinations
+                                .iter_mut()
+                                .map(|dest| dest.write_cdc_events(events.clone()))
+                                .collect();
+
+                            let write_future = try_join_all(write_futures);
                             pin!(write_future);
 
                             let mut write_ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
                             write_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-                            let last_lsn = loop {
+                            let lsn_results = loop {
                                 tokio::select! {
                                     result = &mut write_future => {
                                         break result.map_err(PipelineError::Destination)?;
@@ -213,7 +244,10 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                                 }
                             };
 
-                            current_lsn = last_lsn;
+                            // Get minimum LSN across all destinations
+                            let min_lsn = lsn_results.iter().min().unwrap();
+                            current_lsn = *min_lsn;
+
                             let inner = unsafe {
                                 batch_timeout_stream
                                     .as_mut()
@@ -222,7 +256,7 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                             };
                             inner
                                 .as_mut()
-                                .send_status_update(last_lsn)
+                                .send_status_update(*min_lsn)
                                 .await
                                 .map_err(CommonSourceError::StatusUpdate)?;
                         }
@@ -256,25 +290,46 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
     }
 
     pub async fn start(&mut self) -> Result<(), PipelineError<Src::Error, Dst::Error>> {
-        let resumption_state = self
-            .destination
-            .get_resumption_state()
+        // Get resumption state from all destinations and use the minimum LSN
+        let resumption_futures: Vec<_> = self
+            .destinations
+            .iter_mut()
+            .map(|dest| dest.get_resumption_state())
+            .collect();
+
+        let resumption_states = try_join_all(resumption_futures)
             .await
             .map_err(PipelineError::Destination)?;
+
+        // Find minimum LSN and intersection of copied tables
+        let min_lsn = resumption_states
+            .iter()
+            .map(|state| state.last_lsn)
+            .min()
+            .unwrap_or_else(|| PgLsn::from(0));
+
+        // Only consider tables copied if ALL destinations have them copied
+        let mut copied_tables = resumption_states[0].copied_tables.clone();
+        for state in &resumption_states[1..] {
+            copied_tables = copied_tables
+                .intersection(&state.copied_tables)
+                .cloned()
+                .collect();
+        }
 
         match self.action {
             PipelineAction::TableCopiesOnly => {
                 self.copy_table_schemas().await?;
-                self.copy_tables(&resumption_state.copied_tables).await?;
+                self.copy_tables(&copied_tables).await?;
             }
             PipelineAction::CdcOnly => {
                 self.copy_table_schemas().await?;
-                self.copy_cdc_events(resumption_state.last_lsn).await?;
+                self.copy_cdc_events(min_lsn).await?;
             }
             PipelineAction::Both => {
                 self.copy_table_schemas().await?;
-                self.copy_tables(&resumption_state.copied_tables).await?;
-                self.copy_cdc_events(resumption_state.last_lsn).await?;
+                self.copy_tables(&copied_tables).await?;
+                self.copy_cdc_events(min_lsn).await?;
             }
         }
 
@@ -292,7 +347,7 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
         &self.source
     }
 
-    pub fn destination(&self) -> &Dst {
-        &self.destination
+    pub fn destinations(&self) -> &[Dst] {
+        &self.destinations
     }
 }

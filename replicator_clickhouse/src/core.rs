@@ -21,6 +21,7 @@ pub enum ReplicatorError {
     #[error("The destination {0} is currently unsupported")]
     UnsupportedDestination(String),
 }
+
 pub async fn start_replicator() -> anyhow::Result<()> {
     let replicator_config = load_replicator_config()?;
 
@@ -34,25 +35,38 @@ pub async fn start_replicator() -> anyhow::Result<()> {
         "source settings"
     );
 
-    if let DestinationConfig::ClickHouse {
-        url,
-        database,
-        username,
-        ..
-    } = &replicator_config.destination
-    {
-        info!(url, database, username, "destination settings (ClickHouse)");
-    } else {
-        info!(
-            destination = ?replicator_config.destination,
-            "destination settings (unsupported or unknown type)"
-        );
+    // Log destination settings for all destinations
+    for (index, destination_config) in replicator_config.destinations.as_vec().iter().enumerate() {
+        match destination_config {
+            DestinationConfig::ClickHouse {
+                url,
+                database,
+                username,
+                ..
+            } => {
+                info!(
+                    destination_index = index,
+                    url = url,
+                    database = database,
+                    username = username,
+                    "destination settings (ClickHouse)"
+                );
+            }
+            _ => {
+                info!(
+                    destination_index = index,
+                    destination = ?destination_config,
+                    "destination settings (unsupported or unknown type)"
+                );
+            }
+        }
     }
 
     info!(
         max_size = &replicator_config.pipeline.batch.max_size,
         max_fill_ms = &replicator_config.pipeline.batch.max_fill_ms,
         publication_name = &replicator_config.pipeline.publication_name,
+        destination_count = replicator_config.destination_count(),
         "pipeline settings"
     );
 
@@ -86,15 +100,16 @@ pub async fn start_replicator() -> anyhow::Result<()> {
     )
     .await?;
 
-    let clickhouse_destination = init_destination(&replicator_config).await?;
+    let destinations = init_destinations(&replicator_config).await?;
 
     let batch_config = BatchConfig::new(
         replicator_config.pipeline.batch.max_size,
         Duration::from_millis(replicator_config.pipeline.batch.max_fill_ms),
     );
+
     let mut pipeline = BatchDataPipeline::new(
         postgres_source,
-        clickhouse_destination,
+        destinations,
         PipelineAction::Both,
         batch_config,
     );
@@ -103,22 +118,49 @@ pub async fn start_replicator() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn init_destination(config: &ReplicatorConfig) -> anyhow::Result<ClickHouseBatchDestination> {
-    match &config.destination {
-        DestinationConfig::ClickHouse {
-            url,
-            database,
-            username,
-            password,
-        } => Ok(ClickHouseBatchDestination::new_with_credentials(
-            url.clone(),
-            database.clone(),
-            username.clone(),
-            password.clone(),
-        )
-        .await?),
-        _ => {
-            Err(ReplicatorError::UnsupportedDestination(format!("{:?}", config.destination)).into())
+async fn init_destinations(
+    config: &ReplicatorConfig,
+) -> anyhow::Result<Vec<ClickHouseBatchDestination>> {
+    let mut destinations = Vec::new();
+
+    for (index, destination_config) in config.destinations.as_vec().iter().enumerate() {
+        match destination_config {
+            DestinationConfig::ClickHouse {
+                url,
+                database,
+                username,
+                password,
+            } => {
+                info!(
+                    destination_index = index,
+                    url = url,
+                    database = database,
+                    username = username,
+                    "Initializing ClickHouse destination"
+                );
+
+                let destination = ClickHouseBatchDestination::new_with_credentials(
+                    url.clone(),
+                    database.clone(),
+                    username.clone(),
+                    password.clone(),
+                )
+                .await?;
+                destinations.push(destination);
+            }
+            _ => {
+                return Err(ReplicatorError::UnsupportedDestination(format!(
+                    "Destination {}: {:?}",
+                    index, destination_config
+                ))
+                .into());
+            }
         }
     }
+
+    info!(
+        destination_count = destinations.len(),
+        "Successfully initialized all ClickHouse destinations"
+    );
+    Ok(destinations)
 }

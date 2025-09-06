@@ -172,7 +172,7 @@ impl CdcEventConverter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KeepAliveBody {
     reply: bool,
     wal_end: u64,
@@ -188,7 +188,7 @@ impl KeepAliveBody {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CdcEvent {
     Begin(BeginBody),
     Commit(CommitBody),

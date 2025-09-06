@@ -1,0 +1,303 @@
+use std::{collections::HashMap, io::BufReader, time::Duration, vec};
+
+use crate::config::load_replicator_config;
+use config::shared::{DestinationConfig, ReplicatorConfig};
+
+use async_trait::async_trait;
+use etl::{
+    conversions::{cdc_event::CdcEvent, table_row::TableRow},
+    pipeline::{
+        batching::{data_pipeline::BatchDataPipeline, BatchConfig},
+        destinations::{
+            bigquery::BigQueryBatchDestination, clickhouse::ClickHouseBatchDestination,
+            BatchDestination, DestinationError,
+        },
+        sources::postgres::{PostgresSource, TableNamesFrom},
+        PipelineAction, PipelineResumptionState,
+    },
+    SslMode,
+};
+use postgres::{
+    schema::{TableId, TableSchema},
+    tokio::config::PgConnectionConfig,
+};
+use thiserror::Error;
+use tokio_postgres::types::PgLsn;
+use tracing::{error, info};
+
+#[derive(Debug, Error)]
+pub enum ReplicatorError {
+    #[error("The destination {0} is currently unsupported")]
+    UnsupportedDestination(String),
+}
+
+// Simple enum approach - let the pipeline handle the specifics
+pub enum MixedDestination {
+    BigQuery(BigQueryBatchDestination),
+    ClickHouse(ClickHouseBatchDestination),
+}
+
+// Create a unified error type
+#[derive(Debug, Error)]
+#[error(transparent)]
+pub struct UnifiedDestinationError(anyhow::Error);
+
+impl DestinationError for UnifiedDestinationError {}
+
+impl From<anyhow::Error> for UnifiedDestinationError {
+    fn from(err: anyhow::Error) -> Self {
+        UnifiedDestinationError(err)
+    }
+}
+
+// Implement BatchDestination for MixedDestination
+#[async_trait]
+impl BatchDestination for MixedDestination {
+    type Error = UnifiedDestinationError;
+
+    async fn get_resumption_state(&mut self) -> Result<PipelineResumptionState, Self::Error> {
+        match self {
+            MixedDestination::BigQuery(dest) => dest
+                .get_resumption_state()
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+            MixedDestination::ClickHouse(dest) => dest
+                .get_resumption_state()
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+        }
+    }
+
+    async fn write_table_schemas(
+        &mut self,
+        table_schemas: HashMap<TableId, TableSchema>,
+    ) -> Result<(), Self::Error> {
+        match self {
+            MixedDestination::BigQuery(dest) => dest
+                .write_table_schemas(table_schemas)
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+            MixedDestination::ClickHouse(dest) => dest
+                .write_table_schemas(table_schemas)
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+        }
+    }
+
+    async fn write_table_rows(
+        &mut self,
+        rows: Vec<TableRow>,
+        table_id: TableId,
+    ) -> Result<(), Self::Error> {
+        match self {
+            MixedDestination::BigQuery(dest) => dest
+                .write_table_rows(rows, table_id)
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+            MixedDestination::ClickHouse(dest) => dest
+                .write_table_rows(rows, table_id)
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+        }
+    }
+
+    async fn write_cdc_events(&mut self, events: Vec<CdcEvent>) -> Result<PgLsn, Self::Error> {
+        match self {
+            MixedDestination::BigQuery(dest) => dest
+                .write_cdc_events(events)
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+            MixedDestination::ClickHouse(dest) => dest
+                .write_cdc_events(events)
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+        }
+    }
+
+    async fn table_copied(&mut self, table_id: TableId) -> Result<(), Self::Error> {
+        match self {
+            MixedDestination::BigQuery(dest) => dest
+                .table_copied(table_id)
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+            MixedDestination::ClickHouse(dest) => dest
+                .table_copied(table_id)
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+        }
+    }
+
+    async fn truncate_table(&mut self, table_id: TableId) -> Result<(), Self::Error> {
+        match self {
+            MixedDestination::BigQuery(dest) => dest
+                .truncate_table(table_id)
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+            MixedDestination::ClickHouse(dest) => dest
+                .truncate_table(table_id)
+                .await
+                .map_err(|e| UnifiedDestinationError(e.into())),
+        }
+    }
+}
+
+pub async fn start_replicator() -> anyhow::Result<()> {
+    let replicator_config = load_replicator_config()?;
+    let source = &replicator_config.source;
+
+    info!(
+        host = &source.host,
+        port = source.port,
+        dbname = &source.name,
+        username = &source.username,
+        slot_name = &source.slot_name,
+        "source settings"
+    );
+
+    // Log destination settings
+    for (index, destination_config) in replicator_config.destinations.as_vec().iter().enumerate() {
+        match destination_config {
+            DestinationConfig::BigQuery {
+                project_id,
+                dataset_id,
+                gcp_sa_key_path,
+                max_staleness_mins,
+            } => {
+                info!(
+                    destination_index = index,
+                    project_id,
+                    dataset_id,
+                    gcp_sa_key_path,
+                    max_staleness_mins,
+                    "destination settings (BigQuery)"
+                );
+            }
+            DestinationConfig::ClickHouse {
+                url,
+                database,
+                username,
+                ..
+            } => {
+                info!(
+                    destination_index = index,
+                    url, database, username, "destination settings (ClickHouse)"
+                );
+            }
+            _ => {
+                info!(destination_index = index, destination = ?destination_config, "destination settings (unsupported)");
+            }
+        }
+    }
+
+    info!(
+        max_size = &replicator_config.pipeline.batch.max_size,
+        max_fill_ms = &replicator_config.pipeline.batch.max_fill_ms,
+        publication_name = &replicator_config.pipeline.publication_name,
+        destination_count = replicator_config.destination_count(),
+        "pipeline settings"
+    );
+
+    // SSL setup
+    let mut trusted_root_certs = vec![];
+    let ssl_mode = if source.tls.enabled {
+        let mut root_certs_reader = BufReader::new(source.tls.trusted_root_certs.as_bytes());
+        for cert in rustls_pemfile::certs(&mut root_certs_reader) {
+            trusted_root_certs.push(cert?);
+        }
+        SslMode::VerifyFull
+    } else {
+        SslMode::Disable
+    };
+
+    let postgres_source = PostgresSource::new(
+        PgConnectionConfig {
+            host: source.host.clone(),
+            port: source.port,
+            name: source.name.clone(),
+            username: source.username.clone(),
+            password: source.password.clone().map(Into::into),
+            ssl_mode,
+        },
+        trusted_root_certs,
+        Some(source.slot_name.clone()),
+        TableNamesFrom::Publication(replicator_config.pipeline.publication_name.clone()),
+    )
+    .await?;
+
+    let destinations = init_destinations(&replicator_config).await?;
+    let batch_config = BatchConfig::new(
+        replicator_config.pipeline.batch.max_size,
+        Duration::from_millis(replicator_config.pipeline.batch.max_fill_ms),
+    );
+
+    BatchDataPipeline::new(
+        postgres_source,
+        destinations,
+        PipelineAction::Both,
+        batch_config,
+    )
+    .start()
+    .await?;
+
+    Ok(())
+}
+
+async fn init_destinations(config: &ReplicatorConfig) -> anyhow::Result<Vec<MixedDestination>> {
+    let mut destinations = Vec::new();
+
+    for (index, destination_config) in config.destinations.as_vec().iter().enumerate() {
+        match destination_config {
+            DestinationConfig::BigQuery {
+                project_id,
+                dataset_id,
+                gcp_sa_key_path,
+                max_staleness_mins,
+            } => {
+                info!(
+                    destination_index = index,
+                    project_id, dataset_id, "Initializing BigQuery destination"
+                );
+                let dest = BigQueryBatchDestination::new_with_key_path(
+                    project_id.clone(),
+                    dataset_id.clone(),
+                    gcp_sa_key_path,
+                    *max_staleness_mins,
+                )
+                .await?;
+                destinations.push(MixedDestination::BigQuery(dest));
+            }
+            DestinationConfig::ClickHouse {
+                url,
+                database,
+                username,
+                password,
+            } => {
+                info!(
+                    destination_index = index,
+                    url, database, username, "Initializing ClickHouse destination"
+                );
+                let dest = ClickHouseBatchDestination::new_with_credentials(
+                    url.clone(),
+                    database.clone(),
+                    username.clone(),
+                    password.clone(),
+                )
+                .await?;
+                destinations.push(MixedDestination::ClickHouse(dest));
+            }
+            _ => {
+                return Err(ReplicatorError::UnsupportedDestination(format!(
+                    "Destination {}: {:?}",
+                    index, destination_config
+                ))
+                .into());
+            }
+        }
+    }
+
+    info!(
+        destination_count = destinations.len(),
+        "Successfully initialized all destinations"
+    );
+    Ok(destinations)
+}

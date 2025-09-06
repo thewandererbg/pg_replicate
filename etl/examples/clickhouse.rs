@@ -175,7 +175,7 @@ async fn main_impl() -> Result<(), Box<dyn Error>> {
     );
     let mut pipeline = BatchDataPipeline::new(
         postgres_source,
-        clickhouse_destination,
+        vec![clickhouse_destination],
         action,
         batch_config,
     );

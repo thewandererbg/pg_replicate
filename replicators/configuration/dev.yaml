@@ -1,0 +1,23 @@
+source:
+  host: "172.17.0.1"
+  port: 5432
+  name: "postgres"
+  username: "postgres"
+  password: "postgres"
+  slot_name: "chslot"
+  tls:
+    trusted_root_certs: ""
+    enabled: false
+destinations:
+  - click_house:
+      url: "http://localhost:8123"
+      database: "pgrep"
+      username: "default"
+      password: "password"
+  - big_query:
+      project_id: "my-project"
+      dataset_id: "my_dataset"
+      gcp_sa_key_path: "/path/to/credentials.json"
+      max_staleness_mins: 60
+state_store:
+  memory:

@@ -27,12 +27,13 @@ pub async fn start_replicator() -> anyhow::Result<()> {
     let source = &replicator_config.source;
 
     info!(source = ?replicator_config.source);
-    info!(destination = ?replicator_config.destination);
+    info!(destinations = ?replicator_config.destinations);
 
     info!(
         max_size = &replicator_config.pipeline.batch.max_size,
         max_fill_ms = &replicator_config.pipeline.batch.max_fill_ms,
         publication_name = &replicator_config.pipeline.publication_name,
+        destination_count = replicator_config.destination_count(),
         "pipeline settings"
     );
 
@@ -66,15 +67,16 @@ pub async fn start_replicator() -> anyhow::Result<()> {
     )
     .await?;
 
-    let bigquery_destination = init_destination(&replicator_config).await?;
+    let destinations = init_destinations(&replicator_config).await?;
 
     let batch_config = BatchConfig::new(
         replicator_config.pipeline.batch.max_size,
         Duration::from_millis(replicator_config.pipeline.batch.max_fill_ms),
     );
+
     let mut pipeline = BatchDataPipeline::new(
         postgres_source,
-        bigquery_destination,
+        destinations,
         PipelineAction::Both,
         batch_config,
     );
@@ -83,22 +85,48 @@ pub async fn start_replicator() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn init_destination(config: &ReplicatorConfig) -> anyhow::Result<BigQueryBatchDestination> {
-    match &config.destination {
-        DestinationConfig::BigQuery {
-            project_id,
-            dataset_id,
-            gcp_sa_key_path,
-            max_staleness_mins,
-        } => Ok(BigQueryBatchDestination::new_with_key_path(
-            project_id.clone(),
-            dataset_id.clone(),
-            gcp_sa_key_path,
-            *max_staleness_mins,
-        )
-        .await?),
-        _ => {
-            Err(ReplicatorError::UnsupportedDestination(format!("{:?}", config.destination)).into())
+async fn init_destinations(
+    config: &ReplicatorConfig,
+) -> anyhow::Result<Vec<BigQueryBatchDestination>> {
+    let mut destinations = Vec::new();
+
+    for (index, destination_config) in config.destinations.as_vec().iter().enumerate() {
+        match destination_config {
+            DestinationConfig::BigQuery {
+                project_id,
+                dataset_id,
+                gcp_sa_key_path,
+                max_staleness_mins,
+            } => {
+                info!(
+                    destination_index = index,
+                    project_id = project_id,
+                    dataset_id = dataset_id,
+                    "Initializing BigQuery destination"
+                );
+
+                let destination = BigQueryBatchDestination::new_with_key_path(
+                    project_id.clone(),
+                    dataset_id.clone(),
+                    gcp_sa_key_path,
+                    *max_staleness_mins,
+                )
+                .await?;
+                destinations.push(destination);
+            }
+            _ => {
+                return Err(ReplicatorError::UnsupportedDestination(format!(
+                    "Destination {}: {:?}",
+                    index, destination_config
+                ))
+                .into());
+            }
         }
     }
+
+    info!(
+        destination_count = destinations.len(),
+        "Successfully initialized all destinations"
+    );
+    Ok(destinations)
 }
