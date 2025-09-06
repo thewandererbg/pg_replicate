@@ -33,4 +33,10 @@ impl BatchConfig {
             max_batch_fill_time,
         }
     }
+    pub fn from_config(max_size: usize, max_fill_ms: u64) -> BatchConfig {
+        BatchConfig {
+            max_batch_size: max_size,
+            max_batch_fill_time: Duration::from_millis(max_fill_ms),
+        }
+    }
 }

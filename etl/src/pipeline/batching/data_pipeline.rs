@@ -42,15 +42,6 @@ impl<T> Stream for ReceiverStream<T> {
     }
 }
 
-impl BatchConfig {
-    pub fn from_destination_config(max_size: usize, max_fill_ms: u64) -> Self {
-        BatchConfig {
-            max_batch_size: max_size,
-            max_batch_fill_time: Duration::from_millis(max_fill_ms),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct BatchDataPipelineHandle {
     copy_tables_stream_stop: Arc<Notify>,
@@ -257,7 +248,9 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
         // Main event processing loop
         let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut current_lsn = last_lsn.into();
+        let mut stream0_lsn = last_lsn.into();
+        let mut stream1_lsn = last_lsn.into();
+        let mut current_lsn = std::cmp::min(stream0_lsn, stream1_lsn);
 
         loop {
             tokio::select! {
@@ -277,13 +270,7 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                             // Broadcast to all destinations
                             for sender in &destination_senders {
                                 if let Err(_) = sender.send(event.clone()) {
-                                    return Err(PipelineError::CommonSource(
-                                        CommonSourceError::CdcStream(
-                                            CdcStreamError::CdcEventConversion(
-                                                CdcEventConversionError::UnknownReplicationMessage
-                                            )
-                                        )
-                                    ));
+                                    return Err(PipelineError::Unexpected());
                                 }
                             }
                         }
@@ -299,15 +286,31 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                     match batch_opt {
                         Some(batch) => {
                             info!("got {} cdc events in batch for destination {}",
-                                  batch.len(),
-                                  self.destination_ids[0]);
+                                  batch.len(), self.destination_ids[0]);
 
                             if !batch.is_empty() {
-                                let lsn = self.destinations[0]
-                                    .write_cdc_events(batch)
-                                    .await
-                                    .map_err(PipelineError::Destination)?;
-                                current_lsn = std::cmp::min(current_lsn, lsn);
+                                // Write with ping mechanism inline
+                                let write_future = self.destinations[0].write_cdc_events(batch);
+                                pin!(write_future);
+
+                                let mut write_ping_interval = tokio::time::interval(Duration::from_secs(10));
+                                write_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                                let lsn = loop {
+                                    tokio::select! {
+                                        result = &mut write_future => {
+                                            break result.map_err(PipelineError::Destination)?;
+                                        }
+                                        _ = write_ping_interval.tick() => {
+                                            let _ = cdc_events.as_mut().send_status_update(current_lsn).await;
+                                        }
+                                    }
+                                };
+
+                                stream0_lsn = lsn;
+                                // Send status update with the new LSN
+                                let current_lsn = std::cmp::min(stream0_lsn, stream1_lsn);
+                                let _ = cdc_events.as_mut().send_status_update(current_lsn).await;
                             }
                         }
                         None => {
@@ -321,15 +324,31 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                     match batch_opt {
                         Some(batch) => {
                             info!("got {} cdc events in batch for destination {}",
-                                  batch.len(),
-                                  self.destination_ids[1]);
+                                  batch.len(), self.destination_ids[1]);
 
                             if !batch.is_empty() {
-                                let lsn = self.destinations[1]
-                                    .write_cdc_events(batch)
-                                    .await
-                                    .map_err(PipelineError::Destination)?;
-                                current_lsn = std::cmp::min(current_lsn, lsn);
+                                // Write with ping mechanism inline
+                                let write_future = self.destinations[1].write_cdc_events(batch);
+                                pin!(write_future);
+
+                                let mut write_ping_interval = tokio::time::interval(Duration::from_secs(10));
+                                write_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                                let lsn = loop {
+                                    tokio::select! {
+                                        result = &mut write_future => {
+                                            break result.map_err(PipelineError::Destination)?;
+                                        }
+                                        _ = write_ping_interval.tick() => {
+                                            let _ = cdc_events.as_mut().send_status_update(current_lsn).await;
+                                        }
+                                    }
+                                };
+
+                                stream1_lsn = lsn;
+                                // Send status update with the new LSN
+                                current_lsn = std::cmp::min(stream0_lsn, stream1_lsn);
+                                let _ = cdc_events.as_mut().send_status_update(current_lsn).await;
                             }
                         }
                         None => {
@@ -339,8 +358,8 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                 }
 
                 _ = ping_interval.tick() => {
-                    // Keep connection alive
                     debug!("Keeping connection alive, current LSN: {}", current_lsn);
+                    let _ = cdc_events.as_mut().send_status_update(current_lsn).await;
                 }
 
                 else => break

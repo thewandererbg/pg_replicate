@@ -178,6 +178,9 @@ impl BatchDestination for BigQueryBatchDestination {
                 .await?;
         }
 
+        // sleep 5 seconds after create tables so that bigquery can catch up
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
         self.table_schemas = Some(table_schemas);
 
         Ok(())
