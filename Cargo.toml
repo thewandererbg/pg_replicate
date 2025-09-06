@@ -5,8 +5,6 @@ members = [
     "config",
     "etl",
     "postgres",
-    "replicator_clickhouse",
-    "replicator_bigquery",
     "replicators",
     "telemetry",
 ]
@@ -15,8 +13,6 @@ members = [
 config = { path = "config" }
 etl = { path = "etl" }
 postgres = { path = "postgres" }
-replicator_clickhouse = { path = "replicator_clickhouse" }
-replicator_bigquery = { path = "replicator_bigquery" }
 replicators = { path = "replicators" }
 telemetry = { path = "telemetry" }
 

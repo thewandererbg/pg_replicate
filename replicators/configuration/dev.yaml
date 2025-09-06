@@ -14,10 +14,19 @@ destinations:
       database: "pgrep"
       username: "default"
       password: "password"
+      batch:
+        max_size: 100000
+        max_fill_ms: 10000
   - big_query:
       project_id: "my-project"
       dataset_id: "my_dataset"
       gcp_sa_key_path: "/path/to/credentials.json"
       max_staleness_mins: 60
+      batch:
+        max_size: 100000
+        max_fill_ms: 10000
 state_store:
   memory:
+pipeline:
+  id: 1
+  publication_name: "bqpub"

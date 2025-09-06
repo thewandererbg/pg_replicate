@@ -5,9 +5,6 @@ use crate::environment::{DEV_ENV_NAME, Environment};
 /// Directory containing configuration files relative to the application root.
 const CONFIGURATION_DIR: &str = "configuration";
 
-/// Name of the base configuration file loaded for all environments.
-const BASE_CONFIG_FILE: &str = "base.yaml";
-
 /// Prefix for environment variable overrides in configuration.
 ///
 /// Environment variables with this prefix are used to override configuration values.
@@ -52,9 +49,6 @@ where
 
     let environment_filename = format!("{}.yaml", environment.as_str());
     let settings = rust_cli_config::Config::builder()
-        .add_source(rust_cli_config::File::from(
-            configuration_directory.join(BASE_CONFIG_FILE),
-        ))
         .add_source(rust_cli_config::File::from(
             configuration_directory.join(environment_filename),
         ))

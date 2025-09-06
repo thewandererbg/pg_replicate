@@ -1,14 +1,18 @@
+use futures::Stream;
 use futures::{future::try_join_all, StreamExt};
 use postgres::schema::TableId;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 use std::{collections::HashSet, time::Instant};
 use tokio::pin;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use tokio_postgres::types::PgLsn;
 use tracing::{debug, info};
 
 use crate::{
-    conversions::cdc_event::CdcEventConversionError,
+    conversions::cdc_event::{CdcEvent, CdcEventConversionError},
     pipeline::{
         batching::stream::BatchTimeoutStream,
         destinations::BatchDestination,
@@ -18,6 +22,34 @@ use crate::{
 };
 
 use super::BatchConfig;
+
+// Simple receiver-to-stream wrapper
+struct ReceiverStream<T> {
+    receiver: mpsc::UnboundedReceiver<T>,
+}
+
+impl<T> ReceiverStream<T> {
+    fn new(receiver: mpsc::UnboundedReceiver<T>) -> Self {
+        Self { receiver }
+    }
+}
+
+impl<T> Stream for ReceiverStream<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+impl BatchConfig {
+    pub fn from_destination_config(max_size: usize, max_fill_ms: u64) -> Self {
+        BatchConfig {
+            max_batch_size: max_size,
+            max_batch_fill_time: Duration::from_millis(max_fill_ms),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct BatchDataPipelineHandle {
@@ -35,8 +67,9 @@ impl BatchDataPipelineHandle {
 pub struct BatchDataPipeline<Src: Source, Dst: BatchDestination> {
     source: Src,
     destinations: Vec<Dst>,
+    batch_configs: Vec<BatchConfig>,
+    destination_ids: Vec<String>,
     action: PipelineAction,
-    batch_config: BatchConfig,
     copy_tables_stream_stop: Arc<Notify>,
     cdc_stream_stop: Arc<Notify>,
 }
@@ -44,15 +77,25 @@ pub struct BatchDataPipeline<Src: Source, Dst: BatchDestination> {
 impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
     pub fn new(
         source: Src,
-        destinations: Vec<Dst>,
+        destinations_with_configs: Vec<(Dst, BatchConfig, String)>,
         action: PipelineAction,
-        batch_config: BatchConfig,
     ) -> Self {
+        let mut destinations = Vec::new();
+        let mut batch_configs = Vec::new();
+        let mut destination_ids = Vec::new();
+
+        for (destination, batch_config, destination_id) in destinations_with_configs {
+            destinations.push(destination);
+            batch_configs.push(batch_config);
+            destination_ids.push(destination_id);
+        }
+
         BatchDataPipeline {
             source,
             destinations,
+            batch_configs,
+            destination_ids,
             action,
-            batch_config,
             copy_tables_stream_stop: Arc::new(Notify::new()),
             cdc_stream_stop: Arc::new(Notify::new()),
         }
@@ -60,10 +103,8 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
 
     async fn copy_table_schemas(&mut self) -> Result<(), PipelineError<Src::Error, Dst::Error>> {
         let table_schemas = self.source.get_table_schemas();
-        let table_schemas = table_schemas.clone();
 
         if !table_schemas.is_empty() {
-            // Write table schemas to all destinations in parallel
             let schema_futures: Vec<_> = self
                 .destinations
                 .iter_mut()
@@ -112,9 +153,10 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                 .await
                 .map_err(PipelineError::Source)?;
 
+            // Use single batch stream for table copying (same as original)
             let batch_timeout_stream = BatchTimeoutStream::new(
                 table_rows,
-                self.batch_config.clone(),
+                BatchConfig::new(10000, Duration::from_millis(5000)),
                 self.copy_tables_stream_stop.notified(),
             );
 
@@ -122,13 +164,12 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
 
             while let Some(batch) = batch_timeout_stream.next().await {
                 info!("got {} table copy events in a batch", batch.len());
-                //TODO: Avoid a vec copy
                 let mut rows = Vec::with_capacity(batch.len());
                 for row in batch {
                     rows.push(row.map_err(CommonSourceError::TableCopyStream)?);
                 }
 
-                // Write rows to all destinations in parallel
+                // Write to all destinations in parallel
                 let write_futures: Vec<_> = self
                     .destinations
                     .iter_mut()
@@ -140,7 +181,7 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                     .map_err(PipelineError::Destination)?;
             }
 
-            // Mark table as copied on all destinations in parallel
+            // Mark table as copied on all destinations
             let copied_futures: Vec<_> = self
                 .destinations
                 .iter_mut()
@@ -176,6 +217,7 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
         let mut last_lsn: u64 = last_lsn.into();
         last_lsn += 1;
 
+        // Single CDC stream (the source)
         let cdc_events = self
             .source
             .get_cdc_stream(last_lsn.into())
@@ -183,105 +225,124 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
             .map_err(PipelineError::Source)?;
         pin!(cdc_events);
 
-        let batch_timeout_stream = BatchTimeoutStream::new(
-            cdc_events,
-            self.batch_config.clone(),
+        // Hard-coded for 2 destinations - change this assertion for different counts
+        assert_eq!(
+            self.destinations.len(),
+            2,
+            "This implementation assumes exactly 2 destinations"
+        );
+
+        // Create channels for both destinations
+        let (sender_0, receiver_0) = mpsc::unbounded_channel::<CdcEvent>();
+        let (sender_1, receiver_1) = mpsc::unbounded_channel::<CdcEvent>();
+        let destination_senders = vec![sender_0, sender_1];
+
+        // Create batch streams for each destination with their individual configs
+        let receiver_stream_0 = ReceiverStream::new(receiver_0);
+        let batch_stream_0 = BatchTimeoutStream::new(
+            receiver_stream_0,
+            self.batch_configs[0].clone(),
             self.cdc_stream_stop.notified(),
         );
-        pin!(batch_timeout_stream);
+        pin!(batch_stream_0);
 
-        // Ping the postgresql database each 10s to keep connection alive
-        // in case wal_sender_timeout < max_batch_fill_time
-        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let receiver_stream_1 = ReceiverStream::new(receiver_1);
+        let batch_stream_1 = BatchTimeoutStream::new(
+            receiver_stream_1,
+            self.batch_configs[1].clone(),
+            self.cdc_stream_stop.notified(),
+        );
+        pin!(batch_stream_1);
+
+        // Main event processing loop
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut current_lsn = last_lsn.into();
 
         loop {
             tokio::select! {
-                batch_opt = batch_timeout_stream.next() => {
-                    match batch_opt {
-                        Some(batch) => {
-                            info!("got {} cdc events in a batch", batch.len());
-                            let mut events = Vec::with_capacity(batch.len());
-                            for event in batch {
-                                if let Err(CdcStreamError::CdcEventConversion(
-                                    CdcEventConversionError::MissingSchema(_),
-                                )) = event
-                                {
-                                    continue;
-                                }
-                                let event = event.map_err(CommonSourceError::CdcStream)?;
-                                events.push(event);
+                // Read from source stream
+                event_opt = cdc_events.next() => {
+                    match event_opt {
+                        Some(event) => {
+                            // Handle conversion errors
+                            if let Err(CdcStreamError::CdcEventConversion(
+                                CdcEventConversionError::MissingSchema(_),
+                            )) = event
+                            {
+                                continue;
                             }
+                            let event = event.map_err(CommonSourceError::CdcStream)?;
 
-                            // Write to all destinations in parallel with ping mechanism
-                            let write_futures: Vec<_> = self.destinations
-                                .iter_mut()
-                                .map(|dest| dest.write_cdc_events(events.clone()))
-                                .collect();
-
-                            let write_future = try_join_all(write_futures);
-                            pin!(write_future);
-
-                            let mut write_ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
-                            write_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-                            let lsn_results = loop {
-                                tokio::select! {
-                                    result = &mut write_future => {
-                                        break result.map_err(PipelineError::Destination)?;
-                                    }
-                                    _ = write_ping_interval.tick() => {
-                                        // Send ping with current LSN to keep connection alive during write
-                                        let inner = unsafe {
-                                            batch_timeout_stream
-                                                .as_mut()
-                                                .get_unchecked_mut()
-                                                .get_inner_mut()
-                                        };
-                                        let _ = inner.as_mut().send_status_update(current_lsn).await;
-                                    }
+                            // Broadcast to all destinations
+                            for sender in &destination_senders {
+                                if let Err(_) = sender.send(event.clone()) {
+                                    return Err(PipelineError::CommonSource(
+                                        CommonSourceError::CdcStream(
+                                            CdcStreamError::CdcEventConversion(
+                                                CdcEventConversionError::UnknownReplicationMessage
+                                            )
+                                        )
+                                    ));
                                 }
-                            };
-
-                            // Get minimum LSN across all destinations
-                            let min_lsn = lsn_results.iter().min().unwrap();
-                            current_lsn = *min_lsn;
-
-                            let inner = unsafe {
-                                batch_timeout_stream
-                                    .as_mut()
-                                    .get_unchecked_mut()
-                                    .get_inner_mut()
-                            };
-                            inner
-                                .as_mut()
-                                .send_status_update(*min_lsn)
-                                .await
-                                .map_err(CommonSourceError::StatusUpdate)?;
+                            }
                         }
                         None => {
-                            info!("CDC stream unexpected error");
-                            return Err(PipelineError::CommonSource(
-                                CommonSourceError::CdcStream(
-                                    CdcStreamError::CdcEventConversion(
-                                        CdcEventConversionError::UnknownReplicationMessage
-                                    )
-                                )
-                            ));
+                            info!("CDC stream ended");
+                            break;
                         }
                     }
                 }
-                _ = ping_interval.tick() => {
-                    // Send ping with current LSN to keep connection alive during waiting
-                    let inner = unsafe {
-                        batch_timeout_stream
-                            .as_mut()
-                            .get_unchecked_mut()
-                            .get_inner_mut()
-                    };
-                    let _ = inner.as_mut().send_status_update(current_lsn).await;
+
+                // Poll destination 0's batch stream
+                batch_opt = batch_stream_0.next() => {
+                    match batch_opt {
+                        Some(batch) => {
+                            info!("got {} cdc events in batch for destination {}",
+                                  batch.len(),
+                                  self.destination_ids[0]);
+
+                            if !batch.is_empty() {
+                                let lsn = self.destinations[0]
+                                    .write_cdc_events(batch)
+                                    .await
+                                    .map_err(PipelineError::Destination)?;
+                                current_lsn = std::cmp::min(current_lsn, lsn);
+                            }
+                        }
+                        None => {
+                            info!("Destination 0 batch stream ended");
+                        }
+                    }
                 }
+
+                // Poll destination 1's batch stream
+                batch_opt = batch_stream_1.next() => {
+                    match batch_opt {
+                        Some(batch) => {
+                            info!("got {} cdc events in batch for destination {}",
+                                  batch.len(),
+                                  self.destination_ids[1]);
+
+                            if !batch.is_empty() {
+                                let lsn = self.destinations[1]
+                                    .write_cdc_events(batch)
+                                    .await
+                                    .map_err(PipelineError::Destination)?;
+                                current_lsn = std::cmp::min(current_lsn, lsn);
+                            }
+                        }
+                        None => {
+                            info!("Destination 1 batch stream ended");
+                        }
+                    }
+                }
+
+                _ = ping_interval.tick() => {
+                    // Keep connection alive
+                    debug!("Keeping connection alive, current LSN: {}", current_lsn);
+                }
+
                 else => break
             }
         }
@@ -290,7 +351,7 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
     }
 
     pub async fn start(&mut self) -> Result<(), PipelineError<Src::Error, Dst::Error>> {
-        // Get resumption state from all destinations and use the minimum LSN
+        // Get resumption state from all destinations
         let resumption_futures: Vec<_> = self
             .destinations
             .iter_mut()
@@ -308,7 +369,7 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
             .min()
             .unwrap_or_else(|| PgLsn::from(0));
 
-        // Only consider tables copied if ALL destinations have them copied
+        // Only consider tables copied if ALL destinations have them
         let mut copied_tables = resumption_states[0].copied_tables.clone();
         for state in &resumption_states[1..] {
             copied_tables = copied_tables

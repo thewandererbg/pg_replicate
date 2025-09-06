@@ -5,18 +5,6 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[[example]]
-name = "bigquery"
-required-features = ["bigquery"]
-
-[[example]]
-name = "stdout"
-required-features = ["stdout"]
-
-[[example]]
-name = "clickhouse"
-required-features = ["clickhouse"]
-
 [dependencies]
 postgres = { workspace = true }
 

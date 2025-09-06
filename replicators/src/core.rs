@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::BufReader, time::Duration, vec};
+use std::{collections::HashMap, io::BufReader, vec};
 
 use crate::config::load_replicator_config;
 use config::shared::{DestinationConfig, ReplicatorConfig};
@@ -154,7 +154,7 @@ pub async fn start_replicator() -> anyhow::Result<()> {
         "source settings"
     );
 
-    // Log destination settings
+    // Log destination settings with per-destination batch configs
     for (index, destination_config) in replicator_config.destinations.as_vec().iter().enumerate() {
         match destination_config {
             DestinationConfig::BigQuery {
@@ -162,6 +162,7 @@ pub async fn start_replicator() -> anyhow::Result<()> {
                 dataset_id,
                 gcp_sa_key_path,
                 max_staleness_mins,
+                batch,
             } => {
                 info!(
                     destination_index = index,
@@ -169,6 +170,8 @@ pub async fn start_replicator() -> anyhow::Result<()> {
                     dataset_id,
                     gcp_sa_key_path,
                     max_staleness_mins,
+                    max_size = batch.max_size,
+                    max_fill_ms = batch.max_fill_ms,
                     "destination settings (BigQuery)"
                 );
             }
@@ -176,11 +179,17 @@ pub async fn start_replicator() -> anyhow::Result<()> {
                 url,
                 database,
                 username,
+                batch,
                 ..
             } => {
                 info!(
                     destination_index = index,
-                    url, database, username, "destination settings (ClickHouse)"
+                    url,
+                    database,
+                    username,
+                    max_size = batch.max_size,
+                    max_fill_ms = batch.max_fill_ms,
+                    "destination settings (ClickHouse)"
                 );
             }
             _ => {
@@ -190,8 +199,6 @@ pub async fn start_replicator() -> anyhow::Result<()> {
     }
 
     info!(
-        max_size = &replicator_config.pipeline.batch.max_size,
-        max_fill_ms = &replicator_config.pipeline.batch.max_fill_ms,
         publication_name = &replicator_config.pipeline.publication_name,
         destination_count = replicator_config.destination_count(),
         "pipeline settings"
@@ -224,17 +231,14 @@ pub async fn start_replicator() -> anyhow::Result<()> {
     )
     .await?;
 
-    let destinations = init_destinations(&replicator_config).await?;
-    let batch_config = BatchConfig::new(
-        replicator_config.pipeline.batch.max_size,
-        Duration::from_millis(replicator_config.pipeline.batch.max_fill_ms),
-    );
+    // Initialize destinations with their individual batch configs
+    let destinations_with_configs = init_destinations_with_configs(&replicator_config).await?;
 
+    // Create pipeline with per-destination configs
     BatchDataPipeline::new(
         postgres_source,
-        destinations,
+        destinations_with_configs,
         PipelineAction::Both,
-        batch_config,
     )
     .start()
     .await?;
@@ -242,8 +246,10 @@ pub async fn start_replicator() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn init_destinations(config: &ReplicatorConfig) -> anyhow::Result<Vec<MixedDestination>> {
-    let mut destinations = Vec::new();
+async fn init_destinations_with_configs(
+    config: &ReplicatorConfig,
+) -> anyhow::Result<Vec<(MixedDestination, BatchConfig, String)>> {
+    let mut destinations_with_configs = Vec::new();
 
     for (index, destination_config) in config.destinations.as_vec().iter().enumerate() {
         match destination_config {
@@ -252,10 +258,15 @@ async fn init_destinations(config: &ReplicatorConfig) -> anyhow::Result<Vec<Mixe
                 dataset_id,
                 gcp_sa_key_path,
                 max_staleness_mins,
+                batch,
             } => {
                 info!(
                     destination_index = index,
-                    project_id, dataset_id, "Initializing BigQuery destination"
+                    project_id,
+                    dataset_id,
+                    max_size = batch.max_size,
+                    max_fill_ms = batch.max_fill_ms,
+                    "Initializing BigQuery destination"
                 );
                 let dest = BigQueryBatchDestination::new_with_key_path(
                     project_id.clone(),
@@ -264,17 +275,32 @@ async fn init_destinations(config: &ReplicatorConfig) -> anyhow::Result<Vec<Mixe
                     *max_staleness_mins,
                 )
                 .await?;
-                destinations.push(MixedDestination::BigQuery(dest));
+
+                let batch_config =
+                    BatchConfig::from_destination_config(batch.max_size, batch.max_fill_ms);
+                let destination_id = format!("bigquery_{}", index);
+
+                destinations_with_configs.push((
+                    MixedDestination::BigQuery(dest),
+                    batch_config,
+                    destination_id,
+                ));
             }
             DestinationConfig::ClickHouse {
                 url,
                 database,
                 username,
                 password,
+                batch,
             } => {
                 info!(
                     destination_index = index,
-                    url, database, username, "Initializing ClickHouse destination"
+                    url,
+                    database,
+                    username,
+                    max_size = batch.max_size,
+                    max_fill_ms = batch.max_fill_ms,
+                    "Initializing ClickHouse destination"
                 );
                 let dest = ClickHouseBatchDestination::new_with_credentials(
                     url.clone(),
@@ -283,7 +309,16 @@ async fn init_destinations(config: &ReplicatorConfig) -> anyhow::Result<Vec<Mixe
                     password.clone(),
                 )
                 .await?;
-                destinations.push(MixedDestination::ClickHouse(dest));
+
+                let batch_config =
+                    BatchConfig::from_destination_config(batch.max_size, batch.max_fill_ms);
+                let destination_id = format!("clickhouse_{}", index);
+
+                destinations_with_configs.push((
+                    MixedDestination::ClickHouse(dest),
+                    batch_config,
+                    destination_id,
+                ));
             }
             _ => {
                 return Err(ReplicatorError::UnsupportedDestination(format!(
@@ -296,8 +331,8 @@ async fn init_destinations(config: &ReplicatorConfig) -> anyhow::Result<Vec<Mixe
     }
 
     info!(
-        destination_count = destinations.len(),
-        "Successfully initialized all destinations"
+        destination_count = destinations_with_configs.len(),
+        "Successfully initialized all destinations with individual batch configs"
     );
-    Ok(destinations)
+    Ok(destinations_with_configs)
 }

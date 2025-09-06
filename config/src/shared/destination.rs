@@ -24,6 +24,8 @@ pub enum DestinationConfig {
         gcp_sa_key_path: String,
         /// Maximum staleness in minutes for BigQuery CDC reads.
         max_staleness_mins: u16,
+        /// Batch processing configuration.
+        batch: BatchConfig,
     },
     /// Clickhouse destination configuration.
     ClickHouse {
@@ -35,6 +37,8 @@ pub enum DestinationConfig {
         username: String,
         /// ClickHouse password
         password: String,
+        /// Batch processing configuration.
+        batch: BatchConfig,
     },
 }
 
@@ -47,24 +51,28 @@ impl fmt::Debug for DestinationConfig {
                 dataset_id,
                 gcp_sa_key_path: _,
                 max_staleness_mins,
+                batch, // Added missing batch field
             } => f
                 .debug_struct("BigQuery")
                 .field("project_id", project_id)
                 .field("dataset_id", dataset_id)
                 .field("gcp_sa_key_path", &"REDACTED")
                 .field("max_staleness_mins", max_staleness_mins)
+                .field("batch", batch) // Added batch field to debug output
                 .finish(),
             Self::ClickHouse {
                 url,
                 database,
                 username,
                 password: _,
+                batch, // Added missing batch field
             } => f
                 .debug_struct("ClickHouse")
                 .field("url", url)
                 .field("database", database)
                 .field("username", username)
                 .field("password", &"REDACTED")
+                .field("batch", batch) // Added batch field to debug output
                 .finish(),
         }
     }
@@ -73,5 +81,24 @@ impl fmt::Debug for DestinationConfig {
 impl Default for DestinationConfig {
     fn default() -> Self {
         Self::Memory
+    }
+}
+
+/// Batch processing configuration for pipelines.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BatchConfig {
+    /// Maximum number of items in a batch for table copy and event streaming.
+    pub max_size: usize,
+    /// Maximum time, in milliseconds, to wait for a batch to fill before processing.
+    pub max_fill_ms: u64,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_size: 1000,
+            max_fill_ms: 1000,
+        }
     }
 }
