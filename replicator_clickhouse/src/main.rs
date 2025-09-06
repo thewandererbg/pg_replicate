@@ -8,14 +8,16 @@ mod core;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let app_name = env!("CARGO_BIN_NAME");
-
-    // We pass `emit_on_span_close = false` to avoid emitting logs on span close
-    // for replicator because it is not a web server, and we don't need to emit logs
-    // for every closing span.
     let _log_flusher = init_tracing(app_name, false)?;
 
-    // We start the replicator.
-    start_replicator().await?;
-
-    Ok(())
+    loop {
+        match start_replicator().await {
+            Ok(()) => break Ok(()),
+            Err(e) if e.to_string().contains("schema change detected:") => {
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                continue;
+            }
+            Err(e) => break Err(e),
+        }
+    }
 }

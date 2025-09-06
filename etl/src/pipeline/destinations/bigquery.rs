@@ -33,6 +33,9 @@ pub enum BigQueryDestinationError {
 
     #[error("commit message without begin message")]
     CommitWithoutBegin,
+
+    #[error("schema change detected: {0}")]
+    SchemaChangeRestart(String),
 }
 
 impl DestinationError for BigQueryDestinationError {}
@@ -292,11 +295,9 @@ impl BatchDestination for BigQueryBatchDestination {
                         .collect();
 
                     if !new_columns.is_empty() {
-                        info!(
-                            "Detected new columns in {}: {:?}, restarting the replication",
-                            table_name, new_columns
-                        );
-                        std::process::exit(0);
+                        let message = format!("new columns in {}: {:?}", table_name, new_columns);
+                        info!("Detected {}, requesting restart", message);
+                        return Err(BigQueryDestinationError::SchemaChangeRestart(message));
                     }
                 }
                 CdcEvent::KeepAliveRequested(keep_alive) => {

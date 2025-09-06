@@ -32,6 +32,9 @@ pub enum ClickHouseDestinationError {
 
     #[error("commit message without begin message")]
     CommitWithoutBegin,
+
+    #[error("schema change detected: {0}")]
+    SchemaChangeRestart(String),
 }
 
 impl DestinationError for ClickHouseDestinationError {}
@@ -266,11 +269,9 @@ impl BatchDestination for ClickHouseBatchDestination {
                         .collect();
 
                     if !new_columns.is_empty() {
-                        info!(
-                            "Detected new columns in {}: {:?}, restarting the replication",
-                            table_name, new_columns
-                        );
-                        std::process::exit(0);
+                        let message = format!("new columns in {}: {:?}", table_name, new_columns);
+                        info!("Detected {}, requesting restart", message);
+                        return Err(ClickHouseDestinationError::SchemaChangeRestart(message));
                     }
                 }
                 CdcEvent::KeepAliveRequested(keep_alive) => {
