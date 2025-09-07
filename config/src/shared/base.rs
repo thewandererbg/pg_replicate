@@ -15,6 +15,14 @@ pub enum ValidationError {
     #[error("At least one destination must be configured")]
     NoDestinations,
 
+    /// No BigQuery configuration.
+    #[error("No BigQuery configuration")]
+    NoBigQueryConfig,
+
+    /// No ClickHouse configuration.
+    #[error("No ClickHouse configuration")]
+    NoClickHouseConfig,
+
     /// Duplicate destination names or conflicting configurations.
     #[error("Duplicate or conflicting destination configuration: {0}")]
     DuplicateDestination(String),

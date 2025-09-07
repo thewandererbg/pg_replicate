@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::shared::ValidationError;
+
 /// Configuration options for supported data destinations.
 ///
 /// This enum is used to specify the destination type and its configuration
@@ -51,28 +53,28 @@ impl fmt::Debug for DestinationConfig {
                 dataset_id,
                 gcp_sa_key_path: _,
                 max_staleness_mins,
-                batch, // Added missing batch field
+                batch,
             } => f
                 .debug_struct("BigQuery")
                 .field("project_id", project_id)
                 .field("dataset_id", dataset_id)
                 .field("gcp_sa_key_path", &"REDACTED")
                 .field("max_staleness_mins", max_staleness_mins)
-                .field("batch", batch) // Added batch field to debug output
+                .field("batch", batch)
                 .finish(),
             Self::ClickHouse {
                 url,
                 database,
                 username,
                 password: _,
-                batch, // Added missing batch field
+                batch,
             } => f
                 .debug_struct("ClickHouse")
                 .field("url", url)
                 .field("database", database)
                 .field("username", username)
                 .field("password", &"REDACTED")
-                .field("batch", batch) // Added batch field to debug output
+                .field("batch", batch)
                 .finish(),
         }
     }
@@ -100,5 +102,22 @@ impl Default for BatchConfig {
             max_size: 1000,
             max_fill_ms: 1000,
         }
+    }
+}
+
+impl BatchConfig {
+    /// Validates the batch configuration
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.max_size == 0 {
+            return Err(ValidationError::InvalidDestination(
+                "Batch max_size must be greater than 0".to_string(),
+            ));
+        }
+        if self.max_fill_ms == 0 {
+            return Err(ValidationError::InvalidDestination(
+                "Batch max_fill_ms must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
