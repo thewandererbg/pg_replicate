@@ -12,21 +12,21 @@ source:
     trusted_root_certs: ""
     enabled: false
 destinations:
-  - click_house:
-      url: "http://localhost:8123"
-      database: "pgrep"
-      username: "default"
-      password: "password"
-      batch:
-        max_size: 100000
-        max_fill_ms: 60000
-  - big_query:
-      project_id: "vigo-riders"
-      dataset_id: "dmsin_test"
-      gcp_sa_key_path: "./key_bq.json"
-      max_staleness_mins: 0
-      batch:
-        max_size: 100000
-        max_fill_ms: 10000
+  clickhouse:
+    url: "http://localhost:8123"
+    database: "pgrep"
+    username: "default"
+    password: "password"
+    batch:
+      max_size: 100000
+      max_fill_ms: 60000
+  bigquery:
+    project_id: "vigo-riders"
+    dataset_id: "dmsin_test"
+    gcp_sa_key_path: "./key_bq.json"
+    max_staleness_mins: 0
+    batch:
+      max_size: 100000
+      max_fill_ms: 10000
 state_store:
   memory:

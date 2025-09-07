@@ -155,7 +155,7 @@ pub async fn start_replicator() -> anyhow::Result<()> {
     );
 
     // Log destination settings with per-destination batch configs
-    for (index, destination_config) in replicator_config.destinations.as_vec().iter().enumerate() {
+    for (index, destination_config) in replicator_config.get_destinations().iter().enumerate() {
         match destination_config {
             DestinationConfig::BigQuery {
                 project_id,
@@ -251,7 +251,7 @@ async fn init_destinations_with_configs(
 ) -> anyhow::Result<Vec<(MixedDestination, BatchConfig, String)>> {
     let mut destinations_with_configs = Vec::new();
 
-    for (index, destination_config) in config.destinations.as_vec().iter().enumerate() {
+    for (index, destination_config) in config.get_destinations().iter().enumerate() {
         match destination_config {
             DestinationConfig::BigQuery {
                 project_id,
