@@ -34,6 +34,9 @@ pub enum PipelineError<SrcErr: SourceError, DstErr: DestinationError> {
     #[error("source error: {0}")]
     CommonSource(#[from] sources::CommonSourceError),
 
+    #[error("pipeline error: {0}")]
+    Pipeline(String),
+
     #[error("unexpected error")]
     Unexpected(),
 }

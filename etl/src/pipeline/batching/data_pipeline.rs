@@ -1,15 +1,17 @@
 use futures::Stream;
 use futures::{future::try_join_all, StreamExt};
 use postgres::schema::TableId;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{collections::HashSet, time::Instant};
 use tokio::pin;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_postgres::types::PgLsn;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::{
     conversions::cdc_event::{CdcEvent, CdcEventConversionError},
@@ -65,7 +67,7 @@ pub struct BatchDataPipeline<Src: Source, Dst: BatchDestination> {
     cdc_stream_stop: Arc<Notify>,
 }
 
-impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
+impl<Src: Source, Dst: BatchDestination + Send + 'static> BatchDataPipeline<Src, Dst> {
     pub fn new(
         source: Src,
         destinations_with_configs: Vec<(Dst, BatchConfig, String)>,
@@ -216,41 +218,46 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
             .map_err(PipelineError::Source)?;
         pin!(cdc_events);
 
-        // Hard-coded for 2 destinations - change this assertion for different counts
-        assert_eq!(
-            self.destinations.len(),
-            2,
-            "This implementation assumes exactly 2 destinations"
-        );
+        // Create individual channels for each destination
+        let mut destination_senders = Vec::new();
+        let mut destination_receivers = Vec::new();
 
-        // Create channels for both destinations
-        let (sender_0, receiver_0) = mpsc::unbounded_channel::<CdcEvent>();
-        let (sender_1, receiver_1) = mpsc::unbounded_channel::<CdcEvent>();
-        let destination_senders = vec![sender_0, sender_1];
+        for _ in 0..self.destinations.len() {
+            let (sender, receiver) = mpsc::unbounded_channel::<CdcEvent>();
+            destination_senders.push(sender);
+            destination_receivers.push(receiver);
+        }
 
-        // Create batch streams for each destination with their individual configs
-        let receiver_stream_0 = ReceiverStream::new(receiver_0);
-        let batch_stream_0 = BatchTimeoutStream::new(
-            receiver_stream_0,
-            self.batch_configs[0].clone(),
-            self.cdc_stream_stop.notified(),
-        );
-        pin!(batch_stream_0);
+        // Shared LSN tracking
+        let lsn_tracker = Arc::new(Mutex::new(HashMap::new()));
 
-        let receiver_stream_1 = ReceiverStream::new(receiver_1);
-        let batch_stream_1 = BatchTimeoutStream::new(
-            receiver_stream_1,
-            self.batch_configs[1].clone(),
-            self.cdc_stream_stop.notified(),
-        );
-        pin!(batch_stream_1);
+        // Move destinations out of self and spawn tasks
+        let destinations = std::mem::take(&mut self.destinations);
+        let destination_ids = std::mem::take(&mut self.destination_ids);
+        let batch_configs = std::mem::take(&mut self.batch_configs);
+        let mut task_handles = Vec::new();
+
+        for (idx, destination) in destinations.into_iter().enumerate() {
+            let destination_id = destination_ids[idx].clone();
+            let batch_config = batch_configs[idx].clone();
+            let receiver = destination_receivers.remove(0);
+            let lsn_tracker_clone = lsn_tracker.clone();
+
+            let handle = tokio::spawn(destination_task(
+                destination,
+                destination_id,
+                batch_config,
+                receiver,
+                lsn_tracker_clone,
+                last_lsn.into(),
+            ));
+
+            task_handles.push(handle);
+        }
 
         // Main event processing loop
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
-        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut stream0_lsn = last_lsn.into();
-        let mut stream1_lsn = last_lsn.into();
-        let mut current_lsn = std::cmp::min(stream0_lsn, stream1_lsn);
+        let mut ping_interval = interval(Duration::from_secs(10));
+        ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -267,99 +274,47 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
                             }
                             let event = event.map_err(CommonSourceError::CdcStream)?;
 
-                            // Broadcast to all destinations
+                            // Send to all destination channels
                             for sender in &destination_senders {
                                 if let Err(_) = sender.send(event.clone()) {
-                                    return Err(PipelineError::Unexpected());
+                                    return Err(PipelineError::Pipeline("Destination task stopped unexpectedly".to_string()));
                                 }
                             }
                         }
                         None => {
-                            info!("CDC stream ended");
-                            break;
-                        }
-                    }
-                }
-
-                // Poll destination 0's batch stream
-                batch_opt = batch_stream_0.next() => {
-                    match batch_opt {
-                        Some(batch) => {
-                            info!("got {} cdc events in batch for destination {}",
-                                  batch.len(), self.destination_ids[0]);
-
-                            if !batch.is_empty() {
-                                // Write with ping mechanism inline
-                                let write_future = self.destinations[0].write_cdc_events(batch);
-                                pin!(write_future);
-
-                                let mut write_ping_interval = tokio::time::interval(Duration::from_secs(10));
-                                write_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-                                let lsn = loop {
-                                    tokio::select! {
-                                        result = &mut write_future => {
-                                            break result.map_err(PipelineError::Destination)?;
-                                        }
-                                        _ = write_ping_interval.tick() => {
-                                            let _ = cdc_events.as_mut().send_status_update(current_lsn).await;
-                                        }
-                                    }
-                                };
-
-                                stream0_lsn = lsn;
-                                // Send status update with the new LSN
-                                let current_lsn = std::cmp::min(stream0_lsn, stream1_lsn);
-                                let _ = cdc_events.as_mut().send_status_update(current_lsn).await;
-                            }
-                        }
-                        None => {
-                            info!("Destination 0 batch stream ended");
-                        }
-                    }
-                }
-
-                // Poll destination 1's batch stream
-                batch_opt = batch_stream_1.next() => {
-                    match batch_opt {
-                        Some(batch) => {
-                            info!("got {} cdc events in batch for destination {}",
-                                  batch.len(), self.destination_ids[1]);
-
-                            if !batch.is_empty() {
-                                // Write with ping mechanism inline
-                                let write_future = self.destinations[1].write_cdc_events(batch);
-                                pin!(write_future);
-
-                                let mut write_ping_interval = tokio::time::interval(Duration::from_secs(10));
-                                write_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-                                let lsn = loop {
-                                    tokio::select! {
-                                        result = &mut write_future => {
-                                            break result.map_err(PipelineError::Destination)?;
-                                        }
-                                        _ = write_ping_interval.tick() => {
-                                            let _ = cdc_events.as_mut().send_status_update(current_lsn).await;
-                                        }
-                                    }
-                                };
-
-                                stream1_lsn = lsn;
-                                // Send status update with the new LSN
-                                current_lsn = std::cmp::min(stream0_lsn, stream1_lsn);
-                                let _ = cdc_events.as_mut().send_status_update(current_lsn).await;
-                            }
-                        }
-                        None => {
-                            info!("Destination 1 batch stream ended");
+                            // CDC stream ended unexpectedly, return error
+                            return Err(PipelineError::Unexpected());
                         }
                     }
                 }
 
                 _ = ping_interval.tick() => {
+                    // Calculate minimum LSN from all destinations
+                    let current_lsn = {
+                        let lsn_map = lsn_tracker.lock().await;
+                        if lsn_map.is_empty() {
+                            last_lsn.into()
+                        } else {
+                            *lsn_map.values().min().unwrap_or(&(last_lsn.into()))
+                        }
+                    };
+
                     debug!("Keeping connection alive, current LSN: {}", current_lsn);
                     let _ = cdc_events.as_mut().send_status_update(current_lsn).await;
+                }
+
+                // Check if any destination task has failed
+                result = futures::future::select_all(&mut task_handles) => {
+                    let (task_result, _index, _remaining) = result;
+                    match task_result {
+                        Ok(task_outcome) => {
+                            match task_outcome {
+                                Ok(_) => return Err(PipelineError::Pipeline("Destination task completed unexpectedly".to_string())),
+                                Err(dest_error) => return Err(PipelineError::Destination(dest_error)),
+                            }
+                        }
+                        Err(join_error) => return Err(PipelineError::Pipeline(format!("Destination task panicked: {}", join_error))),
+                    }
                 }
 
                 else => break
@@ -429,5 +384,130 @@ impl<Src: Source, Dst: BatchDestination> BatchDataPipeline<Src, Dst> {
 
     pub fn destinations(&self) -> &[Dst] {
         &self.destinations
+    }
+}
+
+async fn destination_task<Dest>(
+    mut destination: Dest,
+    destination_id: String,
+    batch_config: BatchConfig,
+    event_receiver: mpsc::UnboundedReceiver<CdcEvent>,
+    lsn_tracker: Arc<Mutex<HashMap<String, PgLsn>>>,
+    initial_lsn: PgLsn,
+) -> Result<(), Dest::Error>
+where
+    Dest: BatchDestination + Send + 'static,
+{
+    // Initialize this destination's LSN in the tracker
+    {
+        let mut lsn_map = lsn_tracker.lock().await;
+        lsn_map.insert(destination_id.clone(), initial_lsn);
+    }
+
+    // Create batching stream directly from the receiver
+    let dummy_notify = Arc::new(tokio::sync::Notify::new());
+    let receiver_stream = ReceiverStream::new(event_receiver);
+    let batch_stream =
+        BatchTimeoutStream::new(receiver_stream, batch_config, dummy_notify.notified());
+    pin!(batch_stream);
+
+    loop {
+        match batch_stream.next().await {
+            Some(batch) => {
+                if !batch.is_empty() {
+                    info!(
+                        "got {} cdc events in batch for destination {}",
+                        batch.len(),
+                        destination_id
+                    );
+
+                    if let Err(e) = write_batch_with_retry(
+                        &mut destination,
+                        batch,
+                        &destination_id,
+                        &lsn_tracker,
+                    )
+                    .await
+                    {
+                        let mut lsn_map = lsn_tracker.lock().await;
+                        lsn_map.remove(&destination_id);
+                        return Err(e);
+                    }
+                }
+            }
+            None => {
+                info!("Destination {} batch stream ended", destination_id);
+                break;
+            }
+        }
+    }
+
+    // Clean up this destination's LSN from tracker
+    let mut lsn_map = lsn_tracker.lock().await;
+    lsn_map.remove(&destination_id);
+
+    Ok(())
+}
+
+async fn write_batch_with_retry<Dest>(
+    destination: &mut Dest,
+    batch: Vec<CdcEvent>,
+    destination_id: &str,
+    lsn_tracker: &Arc<Mutex<HashMap<String, PgLsn>>>,
+) -> Result<(), Dest::Error>
+where
+    Dest: BatchDestination + Send + 'static,
+{
+    const INITIAL_DELAY: Duration = Duration::from_secs(30);
+    const MAX_DELAY: Duration = Duration::from_secs(5 * 60);
+    const MAX_TOTAL_TIME: Duration = Duration::from_secs(30 * 60);
+
+    let mut current_delay = INITIAL_DELAY;
+    let start_time = Instant::now();
+    let mut attempt = 1;
+
+    loop {
+        match destination.write_cdc_events(batch.clone()).await {
+            Ok(new_lsn) => {
+                // Success! Update LSN tracker
+                let mut lsn_map = lsn_tracker.lock().await;
+                lsn_map.insert(destination_id.to_string(), new_lsn);
+                return Ok(());
+            }
+            Err(e) if e.to_string().contains("schema change detected:") => {
+                return Err(e);
+            }
+            Err(e) => {
+                error!(
+                    "Destination {} write failed (attempt {}): {:?}",
+                    destination_id, attempt, e
+                );
+
+                // Check if we've exceeded total retry time
+                if start_time.elapsed() >= MAX_TOTAL_TIME {
+                    error!(
+                        "Destination {} exceeded maximum retry time of {} seconds",
+                        destination_id,
+                        MAX_TOTAL_TIME.as_secs()
+                    );
+                    // Return the last error instead of a generic timeout message
+                    return Err(e);
+                }
+
+                info!(
+                    "Retrying destination {} in {:?} (attempt {})",
+                    destination_id,
+                    current_delay,
+                    attempt + 1
+                );
+
+                // Wait with exponential backoff
+                tokio::time::sleep(current_delay).await;
+
+                // Update delay for next iteration (exponential backoff, capped at max)
+                current_delay = std::cmp::min(current_delay * 2, MAX_DELAY);
+                attempt += 1;
+            }
+        }
     }
 }
