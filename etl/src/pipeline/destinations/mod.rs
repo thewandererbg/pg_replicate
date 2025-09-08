@@ -16,6 +16,10 @@ pub mod clickhouse;
 #[cfg(feature = "stdout")]
 pub mod stdout;
 
+// Mixed destination is available when both bigquery and clickhouse features are enabled
+#[cfg(all(feature = "bigquery", feature = "clickhouse"))]
+pub mod mixed;
+
 pub trait DestinationError: std::error::Error + Send + Sync + 'static {}
 
 #[derive(Debug, Error)]
@@ -40,3 +44,16 @@ pub trait BatchDestination {
     async fn table_copied(&mut self, table_id: TableId) -> Result<(), Self::Error>;
     async fn truncate_table(&mut self, table_id: TableId) -> Result<(), Self::Error>;
 }
+
+// Re-exports for convenience when features are enabled
+#[cfg(feature = "bigquery")]
+pub use bigquery::BigQueryBatchDestination;
+
+#[cfg(feature = "clickhouse")]
+pub use clickhouse::ClickHouseBatchDestination;
+
+#[cfg(feature = "stdout")]
+pub use stdout::StdoutDestination;
+
+#[cfg(all(feature = "bigquery", feature = "clickhouse"))]
+pub use mixed::{MixedDestination, MixedDestinationError};

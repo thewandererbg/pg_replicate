@@ -3,6 +3,7 @@ use crate::shared::{
     BatchConfig, DestinationConfig, SourceConfig, StateStoreConfig, ValidationError,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Configuration for the replicator service.
@@ -25,16 +26,24 @@ pub struct ReplicatorConfig {
     pub pipeline: PipelineConfig,
 }
 
-/// Configuration for multiple destinations with environment variable support.
+/// Configuration for a specific destination type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DestinationsConfig {
-    /// ClickHouse destination configuration (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub clickhouse: Option<ClickHouseConfig>,
-    /// BigQuery destination configuration (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bigquery: Option<BigQueryConfig>,
+#[serde(tag = "type")]
+pub enum DestinationTypeConfig {
+    #[serde(rename = "clickhouse")]
+    ClickHouse(ClickHouseConfig),
+    #[serde(rename = "bigquery")]
+    BigQuery(BigQueryConfig),
+    // Easy to add new destination types here in the future
+    // #[serde(rename = "kafka")]
+    // Kafka(KafkaConfig),
 }
+
+/// Configuration for multiple named destinations with environment variable support.
+///
+/// This uses a type alias for HashMap to enable proper serialization/deserialization
+/// while maintaining compatibility with environment variable overrides.
+pub type DestinationsConfig = HashMap<String, DestinationTypeConfig>;
 
 /// ClickHouse destination configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,90 +158,125 @@ impl BigQueryConfig {
     }
 }
 
-impl DestinationsConfig {
-    /// Get all configured destinations as a vector of DestinationConfig enums.
-    /// This is the primary method for accessing destinations.
-    pub fn to_destination_configs(&self) -> Vec<DestinationConfig> {
-        let mut destinations = Vec::new();
+impl DestinationTypeConfig {
+    /// Validates the destination configuration based on its type
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            DestinationTypeConfig::ClickHouse(config) => config.validate(),
+            DestinationTypeConfig::BigQuery(config) => config.validate(),
+        }
+    }
 
-        if let Some(ch) = &self.clickhouse {
-            destinations.push(DestinationConfig::ClickHouse {
+    /// Converts the destination type config to a DestinationConfig enum
+    pub fn to_destination_config(&self) -> DestinationConfig {
+        match self {
+            DestinationTypeConfig::ClickHouse(ch) => DestinationConfig::ClickHouse {
                 url: ch.url.clone(),
                 database: ch.database.clone(),
                 username: ch.username.clone(),
                 password: ch.password.clone(),
                 batch: ch.batch.clone(),
-            });
-        }
-
-        if let Some(bq) = &self.bigquery {
-            destinations.push(DestinationConfig::BigQuery {
+            },
+            DestinationTypeConfig::BigQuery(bq) => DestinationConfig::BigQuery {
                 project_id: bq.project_id.clone(),
                 dataset_id: bq.dataset_id.clone(),
                 gcp_sa_key_path: bq.gcp_sa_key_path.clone(),
                 max_staleness_mins: bq.max_staleness_mins,
                 batch: bq.batch.clone(),
-            });
+            },
         }
+    }
+}
 
-        destinations
+/// Extension trait to add helper methods to DestinationsConfig (HashMap).
+///
+/// This trait provides all the helper methods that were previously on the struct,
+/// allowing for clean method chaining and better ergonomics.
+pub trait DestinationsConfigExt {
+    /// Get all configured destinations as a vector of DestinationConfig enums.
+    /// This is the primary method for accessing destinations.
+    fn to_destination_configs(&self) -> Vec<DestinationConfig>;
+
+    /// Get destination configurations with their names as a vector of tuples.
+    fn get_named_destinations(&self) -> Vec<(String, DestinationConfig)>;
+
+    /// Get all destination names as a vector.
+    fn get_destination_names(&self) -> Vec<&String>;
+
+    /// Check if any ClickHouse destinations are configured.
+    fn has_clickhouse(&self) -> bool;
+
+    /// Check if any BigQuery destinations are configured.
+    fn has_bigquery(&self) -> bool;
+
+    /// Get all ClickHouse destinations with their names.
+    fn get_clickhouse_destinations(&self) -> Vec<(&String, &ClickHouseConfig)>;
+
+    /// Get all BigQuery destinations with their names.
+    fn get_bigquery_destinations(&self) -> Vec<(&String, &BigQueryConfig)>;
+
+    /// Validates all configured destinations.
+    fn validate(&self) -> Result<(), ValidationError>;
+}
+
+impl DestinationsConfigExt for DestinationsConfig {
+    fn to_destination_configs(&self) -> Vec<DestinationConfig> {
+        self.values()
+            .map(|dest| dest.to_destination_config())
+            .collect()
     }
 
-    pub fn has_clickhouse(&self) -> bool {
-        self.clickhouse
-            .as_ref()
-            .map_or(false, |ch| !ch.url.is_empty())
+    fn get_named_destinations(&self) -> Vec<(String, DestinationConfig)> {
+        self.iter()
+            .map(|(name, dest)| (name.clone(), dest.to_destination_config()))
+            .collect()
     }
 
-    /// Check if BigQuery destination is configured
-    pub fn has_bigquery(&self) -> bool {
-        self.bigquery
-            .as_ref()
-            .map_or(false, |bq| !bq.project_id.is_empty())
+    fn get_destination_names(&self) -> Vec<&String> {
+        self.keys().collect()
     }
 
-    /// Get the number of configured destinations
-    pub fn len(&self) -> usize {
-        let mut count = 0;
-        if self.clickhouse.is_some() {
-            count += 1;
-        }
-        if self.bigquery.is_some() {
-            count += 1;
-        }
-        count
+    fn has_clickhouse(&self) -> bool {
+        self.values()
+            .any(|dest| matches!(dest, DestinationTypeConfig::ClickHouse(_)))
     }
 
-    /// Check if there are no destinations configured
-    pub fn is_empty(&self) -> bool {
-        self.clickhouse.is_none() && self.bigquery.is_none()
+    fn has_bigquery(&self) -> bool {
+        self.values()
+            .any(|dest| matches!(dest, DestinationTypeConfig::BigQuery(_)))
     }
 
-    /// Validates all configured destinations
-    pub fn validate(&self) -> Result<(), ValidationError> {
+    fn get_clickhouse_destinations(&self) -> Vec<(&String, &ClickHouseConfig)> {
+        self.iter()
+            .filter_map(|(name, dest)| match dest {
+                DestinationTypeConfig::ClickHouse(config) => Some((name, config)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn get_bigquery_destinations(&self) -> Vec<(&String, &BigQueryConfig)> {
+        self.iter()
+            .filter_map(|(name, dest)| match dest {
+                DestinationTypeConfig::BigQuery(config) => Some((name, config)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn validate(&self) -> Result<(), ValidationError> {
         if self.is_empty() {
             return Err(ValidationError::NoDestinations);
         }
 
-        if !self.has_bigquery() {
-            return Err(ValidationError::NoBigQueryConfig);
-        }
-
-        if !self.has_clickhouse() {
-            return Err(ValidationError::NoClickHouseConfig);
-        }
-
-        // Validate ClickHouse configuration if present
-        if let Some(ch) = &self.clickhouse {
-            ch.validate().map_err(|e| {
-                ValidationError::InvalidDestination(format!("ClickHouse validation failed: {}", e))
-            })?;
-        }
-
-        // Validate BigQuery configuration if present
-        if let Some(bq) = &self.bigquery {
-            bq.validate().map_err(|e| {
-                ValidationError::InvalidDestination(format!("BigQuery validation failed: {}", e))
+        // Validate each destination
+        for (name, dest) in self {
+            dest.validate().map_err(|_| {
+                // Don't double-wrap the error, just add context about which destination failed
+                ValidationError::InvalidDestination(format!(
+                    "Destination '{}' failed validation",
+                    name
+                ))
             })?;
         }
 
@@ -241,25 +285,35 @@ impl DestinationsConfig {
 }
 
 impl ReplicatorConfig {
-    /// Get all configured destinations (exactly 2 required).
+    /// Get all configured destinations.
     /// This is the primary method for accessing destinations from ReplicatorConfig.
     pub fn get_destinations(&self) -> Vec<DestinationConfig> {
         self.destinations.to_destination_configs()
     }
 
-    /// Get the number of configured destinations
+    /// Get destination configurations with their names.
+    pub fn get_named_destinations(&self) -> Vec<(String, DestinationConfig)> {
+        self.destinations.get_named_destinations()
+    }
+
+    /// Get the number of configured destinations.
     pub fn destination_count(&self) -> usize {
         self.destinations.len()
     }
 
-    /// Check if multiple destinations are configured
+    /// Check if multiple destinations are configured.
     pub fn has_multiple_destinations(&self) -> bool {
         self.destinations.len() > 1
     }
 
-    /// Check if there are no destinations configured
+    /// Check if there are no destinations configured.
     pub fn is_empty(&self) -> bool {
         self.destinations.is_empty()
+    }
+
+    /// Get a specific destination by name.
+    pub fn get_destination(&self, name: &str) -> Option<&DestinationTypeConfig> {
+        self.destinations.get(name)
     }
 
     /// Validates the loaded [`ReplicatorConfig`].

@@ -13,6 +13,7 @@ source:
     enabled: false
 destinations:
   clickhouse:
+    type: clickhouse
     url: "http://localhost:8123"
     database: "pgrep"
     username: "default"
@@ -21,6 +22,7 @@ destinations:
       max_size: 100000
       max_fill_ms: 10000
   bigquery:
+    type: bigquery
     project_id: "vigo-riders"
     dataset_id: "dmsin_test"
     gcp_sa_key_path: "./key_bq.json"

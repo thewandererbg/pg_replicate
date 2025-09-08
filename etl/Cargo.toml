@@ -9,6 +9,7 @@ edition = "2021"
 postgres = { workspace = true }
 
 async-trait = { workspace = true }
+anyhow = { workspace = true, features = ["std"] }
 bigdecimal = { workspace = true, features = ["std"] }
 bytes = { workspace = true }
 byteorder = { workspace = true }
