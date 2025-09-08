@@ -61,7 +61,7 @@ pub struct BatchDataPipeline<Src: Source, Dst: BatchDestination> {
     source: Src,
     destinations: Vec<Dst>,
     batch_configs: Vec<BatchConfig>,
-    destination_ids: Vec<String>,
+    destination_names: Vec<String>,
     action: PipelineAction,
     copy_tables_stream_stop: Arc<Notify>,
     cdc_stream_stop: Arc<Notify>,
@@ -75,19 +75,19 @@ impl<Src: Source, Dst: BatchDestination + Send + 'static> BatchDataPipeline<Src,
     ) -> Self {
         let mut destinations = Vec::new();
         let mut batch_configs = Vec::new();
-        let mut destination_ids = Vec::new();
+        let mut destination_names = Vec::new();
 
-        for (destination, batch_config, destination_id) in destinations_with_configs {
+        for (destination, batch_config, destination_name) in destinations_with_configs {
             destinations.push(destination);
             batch_configs.push(batch_config);
-            destination_ids.push(destination_id);
+            destination_names.push(destination_name);
         }
 
         BatchDataPipeline {
             source,
             destinations,
             batch_configs,
-            destination_ids,
+            destination_names,
             action,
             copy_tables_stream_stop: Arc::new(Notify::new()),
             cdc_stream_stop: Arc::new(Notify::new()),
@@ -233,19 +233,19 @@ impl<Src: Source, Dst: BatchDestination + Send + 'static> BatchDataPipeline<Src,
 
         // Move destinations out of self and spawn tasks
         let destinations = std::mem::take(&mut self.destinations);
-        let destination_ids = std::mem::take(&mut self.destination_ids);
+        let destination_names = std::mem::take(&mut self.destination_names);
         let batch_configs = std::mem::take(&mut self.batch_configs);
         let mut task_handles = Vec::new();
 
         for (idx, destination) in destinations.into_iter().enumerate() {
-            let destination_id = destination_ids[idx].clone();
+            let destination_name = destination_names[idx].clone();
             let batch_config = batch_configs[idx].clone();
             let receiver = destination_receivers.remove(0);
             let lsn_tracker_clone = lsn_tracker.clone();
 
             let handle = tokio::spawn(destination_task(
                 destination,
-                destination_id,
+                destination_name,
                 batch_config,
                 receiver,
                 lsn_tracker_clone,
@@ -389,7 +389,7 @@ impl<Src: Source, Dst: BatchDestination + Send + 'static> BatchDataPipeline<Src,
 
 async fn destination_task<Dest>(
     mut destination: Dest,
-    destination_id: String,
+    destination_name: String,
     batch_config: BatchConfig,
     event_receiver: mpsc::UnboundedReceiver<CdcEvent>,
     lsn_tracker: Arc<Mutex<HashMap<String, PgLsn>>>,
@@ -401,7 +401,7 @@ where
     // Initialize this destination's LSN in the tracker
     {
         let mut lsn_map = lsn_tracker.lock().await;
-        lsn_map.insert(destination_id.clone(), initial_lsn);
+        lsn_map.insert(destination_name.clone(), initial_lsn);
     }
 
     // Create batching stream directly from the receiver
@@ -418,25 +418,25 @@ where
                     info!(
                         "got {} cdc events in batch for destination {}",
                         batch.len(),
-                        destination_id
+                        destination_name
                     );
 
                     if let Err(e) = write_batch_with_retry(
                         &mut destination,
                         batch,
-                        &destination_id,
+                        &destination_name,
                         &lsn_tracker,
                     )
                     .await
                     {
                         let mut lsn_map = lsn_tracker.lock().await;
-                        lsn_map.remove(&destination_id);
+                        lsn_map.remove(&destination_name);
                         return Err(e);
                     }
                 }
             }
             None => {
-                info!("Destination {} batch stream ended", destination_id);
+                info!("Destination {} batch stream ended", destination_name);
                 break;
             }
         }
@@ -444,7 +444,7 @@ where
 
     // Clean up this destination's LSN from tracker
     let mut lsn_map = lsn_tracker.lock().await;
-    lsn_map.remove(&destination_id);
+    lsn_map.remove(&destination_name);
 
     Ok(())
 }
@@ -452,7 +452,7 @@ where
 async fn write_batch_with_retry<Dest>(
     destination: &mut Dest,
     batch: Vec<CdcEvent>,
-    destination_id: &str,
+    destination_name: &str,
     lsn_tracker: &Arc<Mutex<HashMap<String, PgLsn>>>,
 ) -> Result<(), Dest::Error>
 where
@@ -471,7 +471,7 @@ where
             Ok(new_lsn) => {
                 // Success! Update LSN tracker
                 let mut lsn_map = lsn_tracker.lock().await;
-                lsn_map.insert(destination_id.to_string(), new_lsn);
+                lsn_map.insert(destination_name.to_string(), new_lsn);
                 return Ok(());
             }
             Err(e) if e.to_string().contains("schema change detected:") => {
@@ -480,14 +480,14 @@ where
             Err(e) => {
                 error!(
                     "Destination {} write failed (attempt {}): {:?}",
-                    destination_id, attempt, e
+                    destination_name, attempt, e
                 );
 
                 // Check if we've exceeded total retry time
                 if start_time.elapsed() >= MAX_TOTAL_TIME {
                     error!(
                         "Destination {} exceeded maximum retry time of {} seconds",
-                        destination_id,
+                        destination_name,
                         MAX_TOTAL_TIME.as_secs()
                     );
                     // Return the last error instead of a generic timeout message
@@ -496,7 +496,7 @@ where
 
                 info!(
                     "Retrying destination {} in {:?} (attempt {})",
-                    destination_id,
+                    destination_name,
                     current_delay,
                     attempt + 1
                 );
