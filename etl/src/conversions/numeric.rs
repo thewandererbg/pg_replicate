@@ -8,9 +8,9 @@ use tokio_postgres::types::{FromSql, IsNull, ToSql, Type};
 
 const POSITIVE_SIGN: u16 = 0x0000;
 const NEGATIVE_SIGN: u16 = 0x4000;
-const NAN_SIGN: u16 = 0xC000;
-const POSITIVE_INFINITY_SIGN: u16 = 0xC000;
-const NEGATIVE_INFINITY_SIGN: u16 = 0xF000;
+const NAN_SIGN: u16 = 0xC000; // NUMERIC_NAN
+const POSITIVE_INFINITY_SIGN: u16 = 0xD000; // NUMERIC_PINF
+const NEGATIVE_INFINITY_SIGN: u16 = 0xF000; // NUMERIC_NINF
 
 /// Sign indicator for Postgres numeric values.
 ///
@@ -462,13 +462,28 @@ fn convert_to_base_10000(
         base_10000_digits.push(digit);
     }
 
-    // Strip leading and trailing zeros
+    // If all groups are zero, normalize to PostgreSQL canonical zero:
+    // weight = 0, digits = [], positive sign; preserve scale.
+    if base_10000_digits.iter().all(|&d| d == 0) {
+        return Ok(PgNumeric::Value {
+            sign: Sign::Positive,
+            weight: 0,
+            scale: dscale,
+            digits: vec![],
+        });
+    }
+
+    // Strip leading zeros first and record how many we removed so we can
+    // adjust the weight correctly. Trailing zeros should NOT influence
+    // the weight because they are fractional groups after the decimal point.
+    let leading_zeros_before_strip =
+        base_10000_digits.iter().take_while(|&&d| d == 0).count() as i32;
+
     strip_leading_zeros(&mut base_10000_digits);
     strip_trailing_zeros(&mut base_10000_digits);
 
-    // Adjust weight if we stripped leading zeros
-    let leading_zeros_stripped = ndigits - base_10000_digits.len() as i32;
-    let final_weight = weight - leading_zeros_stripped;
+    // Adjust weight only by the number of leading zeros that were removed.
+    let final_weight = weight - leading_zeros_before_strip;
 
     Ok(PgNumeric::Value {
         sign,
@@ -610,6 +625,7 @@ fn format_numeric_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
 
     #[test]
     fn parse_simple_integer() {
@@ -762,6 +778,76 @@ mod tests {
     }
 
     #[test]
+    fn zero_canonicalization_basic() {
+        for s in ["0", "0.0", "000", "000.000"] {
+            let num = PgNumeric::from_str(s).unwrap();
+            assert_eq!(num.to_string(), "0");
+
+            if let PgNumeric::Value {
+                sign,
+                weight,
+                scale: _,
+                digits,
+            } = num
+            {
+                assert_eq!(sign, Sign::Positive);
+                assert_eq!(weight, 0);
+                assert!(digits.is_empty());
+            } else {
+                panic!("Expected Value variant");
+            }
+        }
+    }
+
+    #[test]
+    fn zero_canonicalization_negative_zero() {
+        for s in ["-0", "-0.00"] {
+            let num = PgNumeric::from_str(s).unwrap();
+            assert_eq!(num.to_string(), "0");
+
+            if let PgNumeric::Value {
+                sign,
+                weight,
+                scale: _,
+                digits,
+            } = num
+            {
+                // Normalize to positive zero
+                assert_eq!(sign, Sign::Positive);
+                assert_eq!(weight, 0);
+                assert!(digits.is_empty());
+            } else {
+                panic!("Expected Value variant");
+            }
+        }
+    }
+
+    #[test]
+    fn zero_roundtrip_sql() {
+        for s in ["0", "0.000"] {
+            let num = PgNumeric::from_str(s).unwrap();
+            let mut buf = BytesMut::new();
+            ToSql::to_sql(&num, &Type::NUMERIC, &mut buf).unwrap();
+            let round = PgNumeric::from_sql(&Type::NUMERIC, &buf).unwrap();
+            // Internal representation should be canonical-zero with same scale
+            assert_eq!(num, round);
+            if let PgNumeric::Value {
+                sign,
+                weight,
+                digits,
+                ..
+            } = round
+            {
+                assert_eq!(sign, Sign::Positive);
+                assert_eq!(weight, 0);
+                assert!(digits.is_empty());
+            } else {
+                panic!("Expected Value variant");
+            }
+        }
+    }
+
+    #[test]
     fn display_large_numbers() {
         let num = PgNumeric::Value {
             sign: Sign::Positive,
@@ -805,5 +891,159 @@ mod tests {
         let output = format!("{num}");
         // Should display trailing zeros according to scale
         assert!(output.ends_with("0000"));
+    }
+
+    #[test]
+    fn weight_ignores_trailing_fraction_groups() {
+        // 0.0012000 → groups: [12, 0], weight must stay at -1 after stripping
+        let num = PgNumeric::from_str("0.0012000").unwrap();
+        assert_eq!(num.to_string(), "0.0012000");
+
+        if let PgNumeric::Value {
+            sign,
+            weight,
+            scale,
+            ref digits,
+        } = num
+        {
+            assert_eq!(sign, Sign::Positive);
+            assert_eq!(weight, -1, "weight should remain -1");
+            assert_eq!(scale, 7, "scale preserved for display");
+            assert_eq!(
+                digits.as_slice(),
+                &[12],
+                "trailing base-10000 zero group stripped"
+            );
+        } else {
+            panic!("Expected Value variant");
+        }
+    }
+
+    #[test]
+    fn weight_and_groups_boundary_cases() {
+        // 9999.9999 is exactly two full groups: [9999, 9999], weight 0
+        let num_1 = PgNumeric::from_str("9999.9999").unwrap();
+        assert_eq!(num_1.to_string(), "9999.9999");
+
+        if let PgNumeric::Value {
+            sign,
+            weight,
+            scale,
+            ref digits,
+        } = num_1
+        {
+            assert_eq!(sign, Sign::Positive);
+            assert_eq!(weight, 0);
+            assert_eq!(scale, 4);
+            assert_eq!(digits.as_slice(), &[9999, 9999]);
+        } else {
+            panic!("Expected Value variant");
+        }
+
+        // 10000.0001 crosses the 10^4 boundary
+        let num_2 = PgNumeric::from_str("10000.0001").unwrap();
+        assert_eq!(num_2.to_string(), "10000.0001");
+
+        if let PgNumeric::Value {
+            sign,
+            weight,
+            scale,
+            ref digits,
+        } = num_2
+        {
+            assert_eq!(sign, Sign::Positive);
+            assert_eq!(weight, 1);
+            assert_eq!(scale, 4);
+            // Two integer groups [1, 0] and one fractional group [1]
+            assert_eq!(digits.as_slice(), &[1, 0, 1]);
+        } else {
+            panic!("Expected Value variant");
+        }
+    }
+
+    #[test]
+    fn ignores_input_leading_zeros() {
+        let num = PgNumeric::from_str("0000120.00").unwrap();
+        assert_eq!(num.to_string(), "120.00");
+
+        if let PgNumeric::Value {
+            sign,
+            weight,
+            scale,
+            ref digits,
+        } = num
+        {
+            assert_eq!(sign, Sign::Positive);
+            assert_eq!(weight, 0);
+            assert_eq!(scale, 2);
+            assert_eq!(digits.as_slice(), &[120]);
+        } else {
+            panic!("Expected Value variant");
+        }
+    }
+
+    #[test]
+    fn roundtrip_stability() {
+        let cases = [
+            "120.00",
+            "1.2000",
+            "0.0120",
+            "9999.9999",
+            "10000.0001",
+            "-120.00",
+            "1200000",
+        ];
+
+        for case in &cases {
+            let parsed = PgNumeric::from_str(case).unwrap();
+            let printed = parsed.to_string();
+            let reparsed = PgNumeric::from_str(&printed).unwrap();
+
+            // String should be stable across two parses
+            assert_eq!(printed, reparsed.to_string(), "unstable print for {case}");
+
+            // Value representation should be equal across parse/print/parse
+            assert_eq!(parsed, reparsed, "unstable internal value for {case}");
+        }
+    }
+
+    #[test]
+    fn large_integer_weight() {
+        // 1,200,000 = 120*10000 + 0 → digits [120, 0] before strip trailing zero
+        // We expect trailing zero group to be stripped, weight stays 1.
+        let num = PgNumeric::from_str("1200000").unwrap();
+        assert_eq!(num.to_string(), "1200000");
+
+        if let PgNumeric::Value {
+            sign,
+            weight,
+            scale,
+            ref digits,
+        } = num
+        {
+            assert_eq!(sign, Sign::Positive);
+            assert_eq!(weight, 1);
+            assert_eq!(scale, 0);
+            assert_eq!(digits.as_slice(), &[120]);
+        } else {
+            panic!("Expected Value variant");
+        }
+    }
+
+    #[test]
+    fn tosql_fromsql_special_values() {
+        let cases = [
+            PgNumeric::NaN,
+            PgNumeric::PositiveInfinity,
+            PgNumeric::NegativeInfinity,
+        ];
+
+        for case in cases {
+            let mut buf = BytesMut::new();
+            ToSql::to_sql(&case, &Type::NUMERIC, &mut buf).unwrap();
+            let round = PgNumeric::from_sql(&Type::NUMERIC, &buf).unwrap();
+            assert_eq!(format!("{}", case), format!("{}", round));
+            assert_eq!(case, round);
+        }
     }
 }
