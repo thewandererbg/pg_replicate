@@ -27,11 +27,11 @@ use super::BatchConfig;
 
 // Simple receiver-to-stream wrapper
 struct ReceiverStream<T> {
-    receiver: mpsc::UnboundedReceiver<T>,
+    receiver: mpsc::Receiver<T>,
 }
 
 impl<T> ReceiverStream<T> {
-    fn new(receiver: mpsc::UnboundedReceiver<T>) -> Self {
+    fn new(receiver: mpsc::Receiver<T>) -> Self {
         Self { receiver }
     }
 }
@@ -147,9 +147,22 @@ impl<Src: Source, Dst: BatchDestination + Send + 'static> BatchDataPipeline<Src,
                 .map_err(PipelineError::Source)?;
 
             // Use single batch stream for table copying (same as original)
+            let max_batch_size = self
+                .batch_configs
+                .iter()
+                .map(|c| c.max_batch_size)
+                .min()
+                .unwrap();
+            let max_batch_fill_time = self
+                .batch_configs
+                .iter()
+                .map(|c| c.max_batch_fill_time)
+                .min()
+                .unwrap();
+            let batch_config = BatchConfig::new(max_batch_size, max_batch_fill_time);
             let batch_timeout_stream = BatchTimeoutStream::new(
                 table_rows,
-                BatchConfig::new(10000, Duration::from_millis(5000)),
+                batch_config,
                 self.copy_tables_stream_stop.notified(),
             );
 
@@ -219,11 +232,12 @@ impl<Src: Source, Dst: BatchDestination + Send + 'static> BatchDataPipeline<Src,
         pin!(cdc_events);
 
         // Create individual channels for each destination
-        let mut destination_senders = Vec::new();
-        let mut destination_receivers = Vec::new();
+        let mut destination_senders: Vec<mpsc::Sender<CdcEvent>> = Vec::new();
+        let mut destination_receivers: Vec<mpsc::Receiver<CdcEvent>> = Vec::new();
 
-        for _ in 0..self.destinations.len() {
-            let (sender, receiver) = mpsc::unbounded_channel::<CdcEvent>();
+        for batch_config in &self.batch_configs {
+            let buffer_size = batch_config.max_batch_size * 2;
+            let (sender, receiver) = mpsc::channel::<CdcEvent>(buffer_size);
             destination_senders.push(sender);
             destination_receivers.push(receiver);
         }
@@ -276,7 +290,7 @@ impl<Src: Source, Dst: BatchDestination + Send + 'static> BatchDataPipeline<Src,
 
                             // Send to all destination channels
                             for sender in &destination_senders {
-                                if let Err(_) = sender.send(event.clone()) {
+                                if let Err(_) = sender.send(event.clone()).await {
                                     return Err(PipelineError::Pipeline("Destination task stopped unexpectedly".to_string()));
                                 }
                             }
@@ -391,7 +405,7 @@ async fn destination_task<Dest>(
     mut destination: Dest,
     destination_name: String,
     batch_config: BatchConfig,
-    event_receiver: mpsc::UnboundedReceiver<CdcEvent>,
+    event_receiver: mpsc::Receiver<CdcEvent>,
     lsn_tracker: Arc<Mutex<HashMap<String, PgLsn>>>,
     initial_lsn: PgLsn,
 ) -> Result<(), Dest::Error>
