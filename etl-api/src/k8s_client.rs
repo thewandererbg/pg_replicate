@@ -360,6 +360,19 @@ impl K8sClient for HttpK8sClient {
                     "emptyDir": {}
                   }
                 ],
+                // Allow scheduling onto nodes tainted with `nodeType=workloads`.
+                "tolerations": [
+                  {
+                    "key": "nodeType",
+                    "operator": "Equal",
+                    "value": "workloads",
+                    "effect": "NoSchedule"
+                  }
+                ],
+                // Pin pods to nodes labeled with `nodeType=workloads`.
+                "nodeSelector": {
+                  "nodeType": "workloads"
+                },
                 // We want to wait at most 60 seconds before K8S sends a `SIGKILL` to the containers.
                 "terminationGracePeriodSeconds": 60,
                 "initContainers": [
