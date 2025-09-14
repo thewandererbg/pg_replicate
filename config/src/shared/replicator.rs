@@ -34,6 +34,8 @@ pub enum DestinationTypeConfig {
     ClickHouse(ClickHouseConfig),
     #[serde(rename = "bigquery")]
     BigQuery(BigQueryConfig),
+    #[serde(rename = "databricks")]
+    Databricks(DatabricksConfig),
     // Easy to add new destination types here in the future
     // #[serde(rename = "kafka")]
     // Kafka(KafkaConfig),
@@ -158,12 +160,93 @@ impl BigQueryConfig {
     }
 }
 
+// Databricks destination configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabricksConfig {
+    /// Databricks workspace URL
+    pub workspace_url: String,
+    /// Databricks warehouse ID
+    pub warehouse_id: String,
+    /// Databricks access token
+    pub access_token: String,
+    /// Databricks catalog
+    pub catalog: String,
+    /// Databricks schema
+    pub schema: String,
+    /// S3 access key
+    pub s3_access_key: Option<String>,
+    /// S3 secret key
+    pub s3_secret_key: Option<String>,
+    /// S3 region
+    pub s3_region: Option<String>,
+    /// S3 bucket
+    pub s3_bucket: Option<String>,
+
+    /// Batch processing configuration.
+    #[serde(default)]
+    pub batch: BatchConfig,
+}
+
+impl DatabricksConfig {
+    /// Validates the Databricks configuration.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        // Validate workspace URL
+        if self.workspace_url.is_empty() {
+            return Err(ValidationError::InvalidDestination(
+                "workspace_url cannot be empty".to_string(),
+            ));
+        }
+
+        // Basic URL format validation
+        if !self.workspace_url.starts_with("http://") && !self.workspace_url.starts_with("https://")
+        {
+            return Err(ValidationError::InvalidDestination(
+                "Databricks workspace URL must start with http:// or https://".to_string(),
+            ));
+        }
+
+        // Validate warehouse ID
+        if self.warehouse_id.is_empty() {
+            return Err(ValidationError::InvalidDestination(
+                "warehouse_id cannot be empty".to_string(),
+            ));
+        }
+
+        // Validate access token
+        if self.access_token.is_empty() {
+            return Err(ValidationError::InvalidDestination(
+                "access_token cannot be empty".to_string(),
+            ));
+        }
+
+        // Validate catalog
+        if self.catalog.is_empty() {
+            return Err(ValidationError::InvalidDestination(
+                "catalog cannot be empty".to_string(),
+            ));
+        }
+
+        // Validate schema
+        if self.schema.is_empty() {
+            return Err(ValidationError::InvalidDestination(
+                "schema cannot be empty".to_string(),
+            ));
+        }
+
+        // Validate batch configuration
+        self.batch.validate()?;
+
+        Ok(())
+    }
+}
+
 impl DestinationTypeConfig {
     /// Validates the destination configuration based on its type
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
             DestinationTypeConfig::ClickHouse(config) => config.validate(),
             DestinationTypeConfig::BigQuery(config) => config.validate(),
+            DestinationTypeConfig::Databricks(config) => config.validate(),
         }
     }
 
@@ -183,6 +266,18 @@ impl DestinationTypeConfig {
                 gcp_sa_key_path: bq.gcp_sa_key_path.clone(),
                 max_staleness_mins: bq.max_staleness_mins,
                 batch: bq.batch.clone(),
+            },
+            DestinationTypeConfig::Databricks(db) => DestinationConfig::Databricks {
+                workspace_url: db.workspace_url.clone(),
+                warehouse_id: db.warehouse_id.clone(),
+                access_token: db.access_token.clone(),
+                catalog: db.catalog.clone(),
+                schema: db.schema.clone(),
+                s3_access_key: db.s3_access_key.clone(),
+                s3_secret_key: db.s3_secret_key.clone(),
+                s3_region: db.s3_region.clone(),
+                s3_bucket: db.s3_bucket.clone(),
+                batch: db.batch.clone(),
             },
         }
     }
@@ -209,11 +304,17 @@ pub trait DestinationsConfigExt {
     /// Check if any BigQuery destinations are configured.
     fn has_bigquery(&self) -> bool;
 
+    /// Check if any databricks destinations are configured.
+    fn has_databricks(&self) -> bool;
+
     /// Get all ClickHouse destinations with their names.
     fn get_clickhouse_destinations(&self) -> Vec<(&String, &ClickHouseConfig)>;
 
     /// Get all BigQuery destinations with their names.
     fn get_bigquery_destinations(&self) -> Vec<(&String, &BigQueryConfig)>;
+
+    /// Get all databricks destinations with their names.
+    fn get_databricks_destinations(&self) -> Vec<(&String, &DatabricksConfig)>;
 
     /// Validates all configured destinations.
     fn validate(&self) -> Result<(), ValidationError>;
@@ -246,6 +347,11 @@ impl DestinationsConfigExt for DestinationsConfig {
             .any(|dest| matches!(dest, DestinationTypeConfig::BigQuery(_)))
     }
 
+    fn has_databricks(&self) -> bool {
+        self.values()
+            .any(|dest| matches!(dest, DestinationTypeConfig::Databricks(_)))
+    }
+
     fn get_clickhouse_destinations(&self) -> Vec<(&String, &ClickHouseConfig)> {
         self.iter()
             .filter_map(|(name, dest)| match dest {
@@ -259,6 +365,15 @@ impl DestinationsConfigExt for DestinationsConfig {
         self.iter()
             .filter_map(|(name, dest)| match dest {
                 DestinationTypeConfig::BigQuery(config) => Some((name, config)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn get_databricks_destinations(&self) -> Vec<(&String, &DatabricksConfig)> {
+        self.iter()
+            .filter_map(|(name, dest)| match dest {
+                DestinationTypeConfig::Databricks(config) => Some((name, config)),
                 _ => None,
             })
             .collect()

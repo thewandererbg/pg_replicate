@@ -15,6 +15,13 @@ pub struct TableRow {
     pub values: Vec<Cell>,
 }
 
+impl TableRow {
+    #[inline]
+    pub fn get(&self, i: usize) -> Option<&Cell> {
+        self.values.get(i)
+    }
+}
+
 impl BatchBoundaryV1 for TableRow {
     fn is_last_in_batch(&self) -> bool {
         true

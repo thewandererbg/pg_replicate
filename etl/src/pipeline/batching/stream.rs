@@ -91,7 +91,13 @@ impl<'a, B: BatchBoundaryV1, S: Stream<Item = B>> Stream for BatchTimeoutStream<
                 Poll::Ready(Some(item)) => {
                     let is_last_in_batch = item.is_last_in_batch();
                     this.items.push(item);
+
+                    // Normal batching: respect transaction boundaries only if under 2x limit
+                    // Hard limit: force emit if we exceed 2 * max_batch_size otherwise destination will crash
                     if this.items.len() >= this.batch_config.max_batch_size && is_last_in_batch {
+                        *this.reset_timer = true;
+                        return Poll::Ready(Some(std::mem::take(this.items)));
+                    } else if this.items.len() >= 2 * this.batch_config.max_batch_size {
                         *this.reset_timer = true;
                         return Poll::Ready(Some(std::mem::take(this.items)));
                     }

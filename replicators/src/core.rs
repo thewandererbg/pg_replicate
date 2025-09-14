@@ -7,7 +7,9 @@ use etl::{
     pipeline::{
         batching::{data_pipeline::BatchDataPipeline, BatchConfig},
         destinations::{
-            bigquery::BigQueryBatchDestination, clickhouse::ClickHouseBatchDestination,
+            bigquery::BigQueryBatchDestination,
+            clickhouse::ClickHouseBatchDestination,
+            // databricks::DatabricksBatchDestination,
             MixedDestination,
         },
         sources::postgres::{PostgresSource, TableNamesFrom},
@@ -148,6 +150,47 @@ async fn init_destinations_with_configs(
 
                 destinations_with_configs.push((mixed_dest, batch_config, name.clone()));
             }
+            // DestinationConfig::Databricks {
+            //     workspace_url,
+            //     warehouse_id,
+            //     access_token,
+            //     catalog,
+            //     schema,
+            //     s3_access_key,
+            //     s3_secret_key,
+            //     s3_region,
+            //     s3_bucket,
+            //     batch,
+            // } => {
+            //     info!(
+            //         destination_name = %name,
+            //         workspace_url,
+            //         warehouse_id,
+            //         catalog,
+            //         schema,
+            //         max_size = batch.max_size,
+            //         max_fill_ms = batch.max_fill_ms,
+            //         "Initializing Databricks destination"
+            //     );
+
+            //     let dest = DatabricksBatchDestination::new_with_access_token(
+            //         workspace_url,
+            //         warehouse_id,
+            //         access_token,
+            //         catalog,
+            //         schema,
+            //         s3_access_key,
+            //         s3_secret_key,
+            //         s3_region,
+            //         s3_bucket,
+            //     )
+            //     .await?;
+
+            //     let batch_config = BatchConfig::from_config(batch.max_size, batch.max_fill_ms);
+            //     let mixed_dest = MixedDestination::databricks(dest);
+
+            //     destinations_with_configs.push((mixed_dest, batch_config, name.clone()));
+            // }
             _ => {
                 return Err(ReplicatorError::UnsupportedDestination(format!(
                     "Destination '{}': {:?}",

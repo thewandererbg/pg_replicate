@@ -1283,17 +1283,6 @@ impl TableRow {
     }
 }
 
-impl PgNumeric {
-    pub fn to_f64(&self) -> f64 {
-        match self {
-            PgNumeric::NaN => f64::NAN,
-            PgNumeric::PositiveInf => f64::INFINITY,
-            PgNumeric::NegativeInf => f64::NEG_INFINITY,
-            PgNumeric::Value(bd) => bd.to_string().parse::<f64>().unwrap_or(f64::NAN),
-        }
-    }
-}
-
 impl Serialize for ArrayCell {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

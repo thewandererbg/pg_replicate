@@ -13,11 +13,16 @@ use super::PipelineResumptionState;
 pub mod bigquery;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
+#[cfg(feature = "databricks")]
+pub mod databricks;
 #[cfg(feature = "stdout")]
 pub mod stdout;
 
-// Mixed destination is available when both bigquery and clickhouse features are enabled
-#[cfg(all(feature = "bigquery", feature = "clickhouse"))]
+// #[cfg(any(
+//     all(feature = "bigquery", feature = "clickhouse"),
+//     all(feature = "bigquery", feature = "databricks"),
+//     all(feature = "clickhouse", feature = "databricks")
+// ))]
 pub mod mixed;
 
 pub trait DestinationError: std::error::Error + Send + Sync + 'static {}
@@ -52,8 +57,15 @@ pub use bigquery::BigQueryBatchDestination;
 #[cfg(feature = "clickhouse")]
 pub use clickhouse::ClickHouseBatchDestination;
 
+#[cfg(feature = "databricks")]
+pub use databricks::DatabricksBatchDestination;
+
 #[cfg(feature = "stdout")]
 pub use stdout::StdoutDestination;
 
-#[cfg(all(feature = "bigquery", feature = "clickhouse"))]
+// #[cfg(any(
+//     all(feature = "bigquery", feature = "clickhouse"),
+//     all(feature = "bigquery", feature = "databricks"),
+//     all(feature = "clickhouse", feature = "databricks")
+// ))]
 pub use mixed::{MixedDestination, MixedDestinationError};

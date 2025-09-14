@@ -42,6 +42,31 @@ pub enum DestinationConfig {
         /// Batch processing configuration.
         batch: BatchConfig,
     },
+
+    /// Databricks destination configuration.
+    Databricks {
+        /// Databricks workspace URL
+        workspace_url: String,
+        /// Databricks warehouse ID
+        warehouse_id: String,
+        /// Databricks access token
+        access_token: String,
+        /// Databricks catalog
+        catalog: String,
+        /// Databricks schema
+        schema: String,
+        /// S3 access key
+        s3_access_key: Option<String>,
+        /// S3 secret key
+        s3_secret_key: Option<String>,
+        /// S3 region
+        s3_region: Option<String>,
+        /// S3 bucket
+        s3_bucket: Option<String>,
+
+        /// Batch processing configuration.
+        batch: BatchConfig,
+    },
 }
 
 impl fmt::Debug for DestinationConfig {
@@ -74,6 +99,28 @@ impl fmt::Debug for DestinationConfig {
                 .field("database", database)
                 .field("username", username)
                 .field("password", &"REDACTED")
+                .field("batch", batch)
+                .finish(),
+            Self::Databricks {
+                workspace_url,
+                warehouse_id,
+                access_token: _,
+                catalog,
+                schema,
+                s3_access_key: _,
+                s3_secret_key: _,
+                s3_region,
+                s3_bucket,
+                batch,
+            } => f
+                .debug_struct("Databricks")
+                .field("workspace_url", workspace_url)
+                .field("warehouse_id", warehouse_id)
+                .field("access_token", &"REDACTED")
+                .field("catalog", catalog)
+                .field("schema", schema)
+                .field("s3_region", &s3_region)
+                .field("s3_bucket", &s3_bucket)
                 .field("batch", batch)
                 .finish(),
         }

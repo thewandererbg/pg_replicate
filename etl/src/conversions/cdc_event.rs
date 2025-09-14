@@ -207,3 +207,10 @@ impl BatchBoundaryV1 for CdcEvent {
         matches!(self, CdcEvent::Commit(_) | CdcEvent::KeepAliveRequested(_))
     }
 }
+
+#[derive(Debug, Clone)]
+pub enum CdcOperation {
+    Insert(TableRow),
+    Update(TableRow),
+    Delete(TableRow),
+}

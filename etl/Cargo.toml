@@ -17,15 +17,13 @@ chrono = { workspace = true, features = ["serde"] }
 clickhouse = { workspace = true, optional = true }
 const-oid = { workspace = true, default-features = false }
 futures = { workspace = true }
-gcp-bigquery-client = { workspace = true, optional = true, features = [
-    "rust-tls",
-    "aws-lc-rs",
-] }
+gcp-bigquery-client = { workspace = true, optional = true, features = ["rust-tls", "aws-lc-rs"] }
 pg_escape = { workspace = true }
 pin-project-lite = { workspace = true }
 postgres-replication = { workspace = true }
 prost = { workspace = true, optional = true }
 rustls = { workspace = true, features = ["aws-lc-rs", "logging"] }
+reqwest = { workspace = true, default-features = false }
 ring = { workspace = true, default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
@@ -39,24 +37,24 @@ tokio-postgres = { workspace = true, features = [
 ] }
 tokio-rustls = { workspace = true, default-features = false }
 tracing = { workspace = true, default-features = true }
-tracing-subscriber = { workspace = true, default-features = true, features = [
-    "env-filter",
-] }
+tracing-subscriber = { workspace = true, default-features = true, features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }
 x509-cert = { workspace = true, default-features = false }
+regex = { workspace = true, default-features = false }
+
+aws-config = { workspace = true, optional = true, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-s3 = { workspace = true, optional = true, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+arrow = { workspace = true, optional = true, default-features = false }
+parquet = { workspace = true, optional = true, features = ["arrow", "snap"] }
 
 [dev-dependencies]
 postgres = { workspace = true, features = ["test-utils", "tokio"] }
-
-clap = { workspace = true, default-features = true, features = [
-    "std",
-    "derive",
-] }
-
+clap = { workspace = true, default-features = true, features = ["std", "derive"] }
 
 [features]
 bigquery = ["dep:gcp-bigquery-client", "dep:prost"]
 clickhouse = ["dep:clickhouse"]
+databricks = ["dep:aws-config", "dep:aws-sdk-s3", "dep:arrow", "dep:parquet"]
 stdout = []
 # When enabled converts unknown types to bytes
 unknown_types_to_bytes = []

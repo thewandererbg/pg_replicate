@@ -15,6 +15,8 @@ use super::{BatchDestination, DestinationError};
 use super::bigquery::BigQueryBatchDestination;
 #[cfg(feature = "clickhouse")]
 use super::clickhouse::ClickHouseBatchDestination;
+#[cfg(feature = "databricks")]
+use super::databricks::DatabricksBatchDestination;
 
 /// A destination that can hold multiple types of concrete destinations.
 ///
@@ -25,6 +27,8 @@ pub enum MixedDestination {
     BigQuery(BigQueryBatchDestination),
     #[cfg(feature = "clickhouse")]
     ClickHouse(ClickHouseBatchDestination),
+    #[cfg(feature = "databricks")]
+    Databricks(DatabricksBatchDestination),
 }
 
 /// Error type for mixed destination operations.
@@ -56,6 +60,11 @@ impl BatchDestination for MixedDestination {
                 .get_resumption_state()
                 .await
                 .map_err(|e| MixedDestinationError(e.into())),
+            #[cfg(feature = "databricks")]
+            MixedDestination::Databricks(dest) => dest
+                .get_resumption_state()
+                .await
+                .map_err(|e| MixedDestinationError(e.into())),
         }
     }
 
@@ -71,6 +80,11 @@ impl BatchDestination for MixedDestination {
                 .map_err(|e| MixedDestinationError(e.into())),
             #[cfg(feature = "clickhouse")]
             MixedDestination::ClickHouse(dest) => dest
+                .write_table_schemas(table_schemas)
+                .await
+                .map_err(|e| MixedDestinationError(e.into())),
+            #[cfg(feature = "databricks")]
+            MixedDestination::Databricks(dest) => dest
                 .write_table_schemas(table_schemas)
                 .await
                 .map_err(|e| MixedDestinationError(e.into())),
@@ -93,6 +107,11 @@ impl BatchDestination for MixedDestination {
                 .write_table_rows(rows, table_id)
                 .await
                 .map_err(|e| MixedDestinationError(e.into())),
+            #[cfg(feature = "databricks")]
+            MixedDestination::Databricks(dest) => dest
+                .write_table_rows(rows, table_id)
+                .await
+                .map_err(|e| MixedDestinationError(e.into())),
         }
     }
 
@@ -105,6 +124,11 @@ impl BatchDestination for MixedDestination {
                 .map_err(|e| MixedDestinationError(e.into())),
             #[cfg(feature = "clickhouse")]
             MixedDestination::ClickHouse(dest) => dest
+                .write_cdc_events(events)
+                .await
+                .map_err(|e| MixedDestinationError(e.into())),
+            #[cfg(feature = "databricks")]
+            MixedDestination::Databricks(dest) => dest
                 .write_cdc_events(events)
                 .await
                 .map_err(|e| MixedDestinationError(e.into())),
@@ -123,6 +147,11 @@ impl BatchDestination for MixedDestination {
                 .table_copied(table_id)
                 .await
                 .map_err(|e| MixedDestinationError(e.into())),
+            #[cfg(feature = "databricks")]
+            MixedDestination::Databricks(dest) => dest
+                .table_copied(table_id)
+                .await
+                .map_err(|e| MixedDestinationError(e.into())),
         }
     }
 
@@ -135,6 +164,11 @@ impl BatchDestination for MixedDestination {
                 .map_err(|e| MixedDestinationError(e.into())),
             #[cfg(feature = "clickhouse")]
             MixedDestination::ClickHouse(dest) => dest
+                .truncate_table(table_id)
+                .await
+                .map_err(|e| MixedDestinationError(e.into())),
+            #[cfg(feature = "databricks")]
+            MixedDestination::Databricks(dest) => dest
                 .truncate_table(table_id)
                 .await
                 .map_err(|e| MixedDestinationError(e.into())),
@@ -155,6 +189,11 @@ impl MixedDestination {
         MixedDestination::ClickHouse(destination)
     }
 
+    #[cfg(feature = "databricks")]
+    pub fn databricks(destination: DatabricksBatchDestination) -> Self {
+        MixedDestination::Databricks(destination)
+    }
+
     /// Get the destination type as a string for logging/debugging.
     pub fn destination_type(&self) -> &'static str {
         match self {
@@ -162,6 +201,8 @@ impl MixedDestination {
             MixedDestination::BigQuery(_) => "bigquery",
             #[cfg(feature = "clickhouse")]
             MixedDestination::ClickHouse(_) => "clickhouse",
+            #[cfg(feature = "databricks")]
+            MixedDestination::Databricks(_) => "databricks",
         }
     }
 
@@ -175,5 +216,11 @@ impl MixedDestination {
     #[cfg(feature = "clickhouse")]
     pub fn is_clickhouse(&self) -> bool {
         matches!(self, MixedDestination::ClickHouse(_))
+    }
+
+    /// Check if this is a Databricks destination.
+    #[cfg(feature = "databricks")]
+    pub fn is_databricks(&self) -> bool {
+        matches!(self, MixedDestination::Databricks(_))
     }
 }

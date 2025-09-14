@@ -30,5 +30,15 @@ destinations:
     batch:
       max_size: 100000
       max_fill_ms: 60000
+  # databricks:
+  #   type: databricks
+  #   workspace_url: "https://dbc-2267b2d0-0581.cloud.databricks.com"
+  #   warehouse_id: "1f203d4fb0e4fdb2"
+  #   access_token: "PASSWORD"
+  #   catalog: "workspace"
+  #   schema: "cdc_data"
+  #   batch:
+  #     max_size: 20000
+  #     max_fill_ms: 10000
 state_store:
   memory:
