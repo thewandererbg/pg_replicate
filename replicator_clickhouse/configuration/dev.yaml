@@ -1,0 +1,25 @@
+pipeline:
+  id: 1
+  publication_name: "bqpub"
+source:
+  host: "172.17.0.1"
+  port: 5432
+  name: "postgres"
+  username: "postgres"
+  password: "postgres"
+  slot_name: "chslot"
+  tls:
+    trusted_root_certs: ""
+    enabled: false
+destinations:
+  clickhouse:
+    type: clickhouse
+    url: "http://localhost:8123"
+    database: "pgrep"
+    username: "default"
+    password: "password"
+    batch:
+      max_size: 100000
+      max_fill_ms: 10000
+state_store:
+  memory:
