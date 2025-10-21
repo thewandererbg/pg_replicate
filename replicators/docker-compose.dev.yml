@@ -1,7 +1,7 @@
 services:
   server:
     build:
-      context: ..s
+      context: ..
       dockerfile: replicators/Dockerfile
     container_name: "replicators"
     volumes:

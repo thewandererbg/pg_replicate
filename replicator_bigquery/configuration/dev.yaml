@@ -1,0 +1,44 @@
+pipeline:
+  id: 1
+  publication_name: "bqpub"
+source:
+  host: "172.17.0.1"
+  port: 5432
+  name: "postgres"
+  username: "postgres"
+  password: "postgres"
+  slot_name: "chslot"
+  tls:
+    trusted_root_certs: ""
+    enabled: false
+destinations:
+  clickhouse:
+    type: clickhouse
+    url: "http://localhost:8123"
+    database: "pgrep"
+    username: "default"
+    password: "password"
+    batch:
+      max_size: 100000
+      max_fill_ms: 10000
+  bigquery:
+    type: bigquery
+    project_id: "vigo-riders"
+    dataset_id: "dmsin_test"
+    gcp_sa_key_path: "./key_bq.json"
+    max_staleness_mins: 0
+    batch:
+      max_size: 100000
+      max_fill_ms: 60000
+  # databricks:
+  #   type: databricks
+  #   workspace_url: "https://dbc-2267b2d0-0581.cloud.databricks.com"
+  #   warehouse_id: "1f203d4fb0e4fdb2"
+  #   access_token: "PASSWORD"
+  #   catalog: "workspace"
+  #   schema: "cdc_data"
+  #   batch:
+  #     max_size: 20000
+  #     max_fill_ms: 10000
+state_store:
+  memory:
